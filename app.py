@@ -78,34 +78,65 @@ def get_prob_from_model(params, line, dist_name):
         elif dist_name == 'skewt' and SKEWT_AVAILABLE: prob_le_k = skewt.cdf(k, a=params[0], df=params[1], loc=params[2], scale=params[3])
     return 1 - prob_le_k
 
-def calculate_fit_error(params, market_df, anchor_line, anchor_prob, dist_name):
-    """Generic error function for any distribution."""
-    if any(pd.isna(params)): return 1e9
-    total_error = 0
+def calculate_fit_error(params, market_df, dist_name):
+    """Error function: fit only to the market lines (no anchor)."""
+    if any(pd.isna(params)): 
+        return 1e9
     over_data = market_df[market_df['type'] == 'over']
     model_probs = over_data['line'].apply(lambda x: get_prob_from_model(params, x, dist_name))
-    total_error = np.sum((model_probs - over_data['fair_prob'])**2)
-    anchor_model_prob = get_prob_from_model(params, anchor_line, dist_name)
-    anchor_error = (anchor_model_prob - anchor_prob)**2
-    return total_error + 100 * anchor_error
+    return np.sum((model_probs - over_data['fair_prob'])**2)
 
-def fit_model(market_df, anchor_line, anchor_prob, dist_name):
-    """Finds the best-fit parameters for any given distribution."""
+def fit_model(market_df, dist_name, anchor_line=None, anchor_prob=None):
+    """Fit the distribution to market data only."""
     models = {
-        'poisson': {'guess': [anchor_line], 'bounds': [(0.1, None)]},
+        'poisson': {'guess': [market_df['line'].mean()], 'bounds': [(0.1, None)]},
         'nbinom': {'guess': [20, 0.5], 'bounds': [(0.1, None), (0.01, 0.99)]},
-        'zip': {'guess': [0.1, anchor_line], 'bounds': [(0.01, 0.99), (0.1, None)]},
-        'norm': {'guess': [anchor_line, 5], 'bounds': [(None, None), (0.1, None)]},
-        'lognorm': {'guess': [0.5, 0, anchor_line], 'bounds': [(0.01, None), (None, None), (0.1, None)]},
-        'weibull': {'guess': [1.5, 0, anchor_line], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
-        'gamma': {'guess': [2, 0, anchor_line / 2], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
-        'skewt': {'guess': [0, 10, anchor_line, 5], 'bounds': [(None, None), (1, None), (None, None), (0.1, None)]}
+        'zip': {'guess': [0.1, market_df['line'].mean()], 'bounds': [(0.01, 0.99), (0.1, None)]},
+        'norm': {'guess': [market_df['line'].mean(), 5], 'bounds': [(None, None), (0.1, None)]},
+        'lognorm': {'guess': [0.5, 0, market_df['line'].mean()], 'bounds': [(0.01, None), (None, None), (0.1, None)]},
+        'weibull': {'guess': [1.5, 0, market_df['line'].mean()], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
+        'gamma': {'guess': [2, 0, market_df['line'].mean()/2], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
+        'skewt': {'guess': [0, 10, market_df['line'].mean(), 5], 'bounds': [(None, None), (1, None), (None, None), (0.1, None)]}
     }
     config = models[dist_name]
-    result = minimize(calculate_fit_error, config['guess'], args=(market_df, anchor_line, anchor_prob, dist_name), bounds=config['bounds'], method='L-BFGS-B')
+    result = minimize(calculate_fit_error, config['guess'], 
+                      args=(market_df, dist_name), 
+                      bounds=config['bounds'], method='L-BFGS-B')
     if not result.success:
         st.warning(f"Optimizer failed to converge for {dist_name}. Results may be unreliable.")
     return result.x
+
+def apply_anchor_shift(params, dist_name, anchor_line, anchor_prob):
+    """Shift the mean/location of the fitted distribution so it matches the anchor probability."""
+    target_cdf = 1 - anchor_prob  # because anchor_prob = P(X > line)
+    
+    def shift_error(shift):
+        shifted_params = params.copy()
+        if dist_name in ['poisson', 'nbinom', 'norm']:
+            shifted_params[0] = params[0] + shift
+        elif dist_name == 'lognorm':
+            shifted_params[2] = params[2] + shift  # shift loc
+        elif dist_name in ['weibull', 'gamma']:
+            shifted_params[1] = params[1] + shift  # shift loc
+        elif dist_name == 'skewt':
+            shifted_params[2] = params[2] + shift  # shift loc
+        model_cdf = 1 - get_prob_from_model(shifted_params, anchor_line, dist_name)
+        return (model_cdf - target_cdf)**2
+    
+    res = minimize(shift_error, [0.0], method='Nelder-Mead')
+    shift = res.x[0]
+    
+    shifted_params = params.copy()
+    if dist_name in ['poisson', 'nbinom', 'norm']:
+        shifted_params[0] = params[0] + shift
+    elif dist_name == 'lognorm':
+        shifted_params[2] = params[2] + shift
+    elif dist_name in ['weibull', 'gamma']:
+        shifted_params[1] = params[1] + shift
+    elif dist_name == 'skewt':
+        shifted_params[2] = params[2] + shift
+    
+    return shifted_params
 
 # ==============================================================================
 # 4. MAIN ANALYSIS FUNCTION
@@ -150,7 +181,8 @@ def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_thres
 
             for dist_name in models_to_test:
                 try:
-                    params = fit_model(devigged_df, anchor_line, anchor_fair_prob, dist_name)
+                    params = fit_model(devigged_df, dist_name)
+                    params = apply_anchor_shift(params, dist_name, anchor_line, anchor_fair_prob)
                     model_probs = devigged_df['line'].apply(lambda x: get_prob_from_model(params, x, dist_name))
                     mae = (devigged_df[devigged_df['type']=='over']['fair_prob'] - model_probs[devigged_df['type']=='over']).abs().mean()
                     
