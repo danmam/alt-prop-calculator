@@ -18,7 +18,6 @@ import io
 # 0. CONFIGURATION
 # ==============================================================================
 DEFAULT_MAE_THRESHOLD = 0.05
-# A 7.1% vig means the probabilities sum to 107.1%, or 1.071
 DEFAULT_VIG_MARKET_TOTAL = 1.071
 
 # ==============================================================================
@@ -141,7 +140,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     all_market_data = []
     anchor_fair_prob = american_to_prob(anchor_odds)
     
-    # --- Vig Sharing Logic ---
     book_dataframes = {}
     book_vigs = {}
     for book in books:
@@ -150,16 +148,13 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         market_df = pd.melt(book_df, id_vars=['line'], value_vars=['over', 'under'], var_name='type', value_name='odds').dropna(subset=['odds'])
         book_dataframes[book] = market_df
         
-        # --- MODIFICATION START: Safer vig calculation ---
         pivot = market_df.pivot_table(index='line', columns='type', values='odds')
-        # Check if both columns exist before trying to access them
         if 'over' in pivot.columns and 'under' in pivot.columns:
             two_way_market = pivot[['over', 'under']].dropna().applymap(american_to_prob)
             if not two_way_market.empty:
                 market_total = two_way_market['over'].iloc[0] + two_way_market['under'].iloc[0]
                 book_vigs[book] = market_total
                 st.info(f"Found 2-way market for **{book.upper()}** (Vig: {market_total:.4f}).")
-        # --- MODIFICATION END ---
 
     shared_vig = next(iter(book_vigs.values()), None)
     
@@ -170,7 +165,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
                 st.warning(f"No data for {book.upper()}. Skipping.")
                 continue
 
-            # Vig application hierarchy
             if book in book_vigs:
                 vig_to_use = book_vigs[book]
                 st.write(f"Using **{book.upper()}'s own vig** for devigging.")
@@ -182,7 +176,11 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
                 st.warning(f"No 2-way market found. Using **default vig** of {vig_to_use:.4f}.")
                 
             devigged_df = devig_market_data(market_df, vig_to_use)
+            
+            # --- THIS IS THE CORRECTED SECTION ---
+            devigged_df['book'] = book 
             all_market_data.append(devigged_df)
+            # --- END CORRECTION ---
             
             best_model_for_book = None
             min_mae = float('inf')
@@ -315,7 +313,6 @@ if uploaded_file is not None:
                 run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold)
 
     except Exception as e:
-        # Provide a more descriptive error message
         st.error(f"An error occurred: {e}")
         st.error("This might be due to an unexpected file format or data issue. Please check your CSV file.")
 else:
