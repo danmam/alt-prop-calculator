@@ -17,11 +17,12 @@ import io
 # ==============================================================================
 # 0. CONFIGURATION
 # ==============================================================================
-# Set a default MAE threshold, can be adjusted in the UI
 DEFAULT_MAE_THRESHOLD = 0.05
+# A 7.1% vig means the probabilities sum to 107.1%, or 1.071
+DEFAULT_VIG_MARKET_TOTAL = 1.071
 
 # ==============================================================================
-# 1. UTILITY & MODELING FUNCTIONS (Copied from our previous script)
+# 1. UTILITY & MODELING FUNCTIONS
 # ==============================================================================
 
 def american_to_prob(odds):
@@ -49,17 +50,16 @@ def zip_cdf(k, pi, lam):
             return 1.0
     return cdf_val
 
-def devig_market_data(df):
-    """Devigs lines for a single book using a 2-way market to find the vig."""
+def devig_market_data(df, market_total=None):
+    """Applies a given market_total (vig) to a dataframe."""
     df['prob'] = df['odds'].apply(american_to_prob)
-    two_way_market = df.pivot_table(index='line', columns='type', values='prob').dropna()
-    if two_way_market.empty:
-        st.warning(f"No 2-way market found for one of the books. Its probabilities will not be devigged.")
+    
+    if market_total:
+        df['fair_prob'] = df['prob'] / market_total
+    else:
+        # This case should no longer be hit if the new logic works
+        st.warning("Proceeding without devigging.")
         df['fair_prob'] = df['prob']
-        return df
-    market_total = two_way_market['over'].iloc[0] + two_way_market['under'].iloc[0]
-    st.info(f"Found 2-way market at line {two_way_market.index[0]} (Total: {market_total:.4f}). Applying this vig to all lines for this book.")
-    df['fair_prob'] = df['prob'] / market_total
     return df
 
 def get_prob_from_model(params, line, dist_name):
@@ -78,71 +78,50 @@ def get_prob_from_model(params, line, dist_name):
         elif dist_name == 'skewt' and SKEWT_AVAILABLE: prob_le_k = skewt.cdf(k, a=params[0], df=params[1], loc=params[2], scale=params[3])
     return 1 - prob_le_k
 
-def calculate_fit_error(params, market_df, dist_name):
-    """Error function: fit only to the market lines (no anchor)."""
-    if any(pd.isna(params)): 
-        return 1e9
+def calculate_fit_error(params, market_df, use_anchor, anchor_line, anchor_prob, dist_name):
+    """Generic error function, with optional anchor point."""
+    if any(pd.isna(params)): return 1e9
+    
+    total_error = 0
     over_data = market_df[market_df['type'] == 'over']
     model_probs = over_data['line'].apply(lambda x: get_prob_from_model(params, x, dist_name))
-    return np.sum((model_probs - over_data['fair_prob'])**2)
+    total_error = np.sum((model_probs - over_data['fair_prob'])**2)
+    
+    anchor_error = 0
+    if use_anchor:
+        anchor_model_prob = get_prob_from_model(params, anchor_line, dist_name)
+        anchor_error = (anchor_model_prob - anchor_prob)**2
+    
+    return total_error + 100 * anchor_error
 
-def fit_model(market_df, dist_name, anchor_line=None, anchor_prob=None):
-    """Fit the distribution to market data only."""
+def fit_model(market_df, use_anchor, anchor_line, anchor_prob, dist_name):
+    """Finds the best-fit parameters for any given distribution."""
+    if not use_anchor and not market_df.empty:
+        mean_estimate = market_df.iloc[(market_df['fair_prob']-0.5).abs().argsort()[:1]]['line'].values[0]
+    else:
+        mean_estimate = anchor_line
+
     models = {
-        'poisson': {'guess': [market_df['line'].mean()], 'bounds': [(0.1, None)]},
+        'poisson': {'guess': [mean_estimate], 'bounds': [(0.1, None)]},
         'nbinom': {'guess': [20, 0.5], 'bounds': [(0.1, None), (0.01, 0.99)]},
-        'zip': {'guess': [0.1, market_df['line'].mean()], 'bounds': [(0.01, 0.99), (0.1, None)]},
-        'norm': {'guess': [market_df['line'].mean(), 5], 'bounds': [(None, None), (0.1, None)]},
-        'lognorm': {'guess': [0.5, 0, market_df['line'].mean()], 'bounds': [(0.01, None), (None, None), (0.1, None)]},
-        'weibull': {'guess': [1.5, 0, market_df['line'].mean()], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
-        'gamma': {'guess': [2, 0, market_df['line'].mean()/2], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
-        'skewt': {'guess': [0, 10, market_df['line'].mean(), 5], 'bounds': [(None, None), (1, None), (None, None), (0.1, None)]}
+        'zip': {'guess': [0.1, mean_estimate], 'bounds': [(0.01, 0.99), (0.1, None)]},
+        'norm': {'guess': [mean_estimate, 5], 'bounds': [(None, None), (0.1, None)]},
+        'lognorm': {'guess': [0.5, 0, mean_estimate], 'bounds': [(0.01, None), (None, None), (0.1, None)]},
+        'weibull': {'guess': [1.5, 0, mean_estimate], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
+        'gamma': {'guess': [2, 0, mean_estimate / 2], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
+        'skewt': {'guess': [0, 10, mean_estimate, 5], 'bounds': [(None, None), (1, None), (None, None), (0.1, None)]}
     }
     config = models[dist_name]
-    result = minimize(calculate_fit_error, config['guess'], 
-                      args=(market_df, dist_name), 
-                      bounds=config['bounds'], method='L-BFGS-B')
+    result = minimize(calculate_fit_error, config['guess'], args=(market_df, use_anchor, anchor_line, anchor_prob, dist_name), bounds=config['bounds'], method='L-BFGS-B')
     if not result.success:
         st.warning(f"Optimizer failed to converge for {dist_name}. Results may be unreliable.")
     return result.x
 
-def apply_anchor_shift(params, dist_name, anchor_line, anchor_prob):
-    """Shift the mean/location of the fitted distribution so it matches the anchor probability."""
-    target_cdf = 1 - anchor_prob  # because anchor_prob = P(X > line)
-    
-    def shift_error(shift):
-        shifted_params = params.copy()
-        if dist_name in ['poisson', 'nbinom', 'norm']:
-            shifted_params[0] = params[0] + shift
-        elif dist_name == 'lognorm':
-            shifted_params[2] = params[2] + shift  # shift loc
-        elif dist_name in ['weibull', 'gamma']:
-            shifted_params[1] = params[1] + shift  # shift loc
-        elif dist_name == 'skewt':
-            shifted_params[2] = params[2] + shift  # shift loc
-        model_cdf = 1 - get_prob_from_model(shifted_params, anchor_line, dist_name)
-        return (model_cdf - target_cdf)**2
-    
-    res = minimize(shift_error, [0.0], method='Nelder-Mead')
-    shift = res.x[0]
-    
-    shifted_params = params.copy()
-    if dist_name in ['poisson', 'nbinom', 'norm']:
-        shifted_params[0] = params[0] + shift
-    elif dist_name == 'lognorm':
-        shifted_params[2] = params[2] + shift
-    elif dist_name in ['weibull', 'gamma']:
-        shifted_params[1] = params[1] + shift
-    elif dist_name == 'skewt':
-        shifted_params[2] = params[2] + shift
-    
-    return shifted_params
-
 # ==============================================================================
 # 4. MAIN ANALYSIS FUNCTION
 # ==============================================================================
-def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_threshold):
-    """This function contains the core logic from our previous script's main() function."""
+def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold):
+    """Contains the core analysis logic with vig sharing and a default vig fallback."""
     
     df.columns = ['textsm', 'fd_over', 'fd_under', 'dk_over', 'dk_under']
     df.replace(['-', ''], np.nan, inplace=True)
@@ -163,17 +142,44 @@ def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_thres
     all_market_data = []
     anchor_fair_prob = american_to_prob(anchor_odds)
     
+    # --- Vig Sharing Logic ---
+    book_dataframes = {}
+    book_vigs = {}
+    for book in books:
+        book_df = df[['textsm', f'{book}_over', f'{book}_under']].copy()
+        book_df.columns = ['line', 'over', 'under']
+        market_df = pd.melt(book_df, id_vars=['line'], value_vars=['over', 'under'], var_name='type', value_name='odds').dropna(subset=['odds'])
+        book_dataframes[book] = market_df
+        
+        two_way_market = market_df.pivot_table(index='line', columns='type', values='odds').dropna().applymap(american_to_prob)
+        if not two_way_market.empty:
+            market_total = two_way_market['over'].iloc[0] + two_way_market['under'].iloc[0]
+            book_vigs[book] = market_total
+            st.info(f"Found 2-way market for **{book.upper()}** (Vig: {market_total:.4f}).")
+
+    shared_vig = next(iter(book_vigs.values()), None)
+    
     for book in books:
         with st.expander(f"Processing for {book.upper()}..."):
-            book_df = df[['textsm', f'{book}_over', f'{book}_under']].copy()
-            book_df.columns = ['line', 'over', 'under']
-            market_df = pd.melt(book_df, id_vars=['line'], value_vars=['over', 'under'], var_name='type', value_name='odds').dropna(subset=['odds'])
-            if market_df.empty:
+            market_df = book_dataframes.get(book)
+            if market_df is None or market_df.empty:
                 st.warning(f"No data for {book.upper()}. Skipping.")
                 continue
 
-            devigged_df = devig_market_data(market_df)
-            devigged_df['book'] = book # preserve source
+            # --- MODIFICATION START ---
+            # Vig application hierarchy
+            if book in book_vigs:
+                vig_to_use = book_vigs[book]
+                st.write(f"Using **{book.upper()}'s own vig** for devigging.")
+            elif shared_vig:
+                vig_to_use = shared_vig
+                st.write(f"Using **shared vig** ({vig_to_use:.4f}) from another book.")
+            else:
+                vig_to_use = DEFAULT_VIG_MARKET_TOTAL
+                st.warning(f"No 2-way market found. Using **default vig** of {vig_to_use:.4f}.")
+            # --- MODIFICATION END ---
+                
+            devigged_df = devig_market_data(market_df, vig_to_use)
             all_market_data.append(devigged_df)
             
             best_model_for_book = None
@@ -181,8 +187,7 @@ def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_thres
 
             for dist_name in models_to_test:
                 try:
-                    params = fit_model(devigged_df, dist_name)
-                    params = apply_anchor_shift(params, dist_name, anchor_line, anchor_fair_prob)
+                    params = fit_model(devigged_df, use_anchor, anchor_line, anchor_fair_prob, dist_name)
                     model_probs = devigged_df['line'].apply(lambda x: get_prob_from_model(params, x, dist_name))
                     mae = (devigged_df[devigged_df['type']=='over']['fair_prob'] - model_probs[devigged_df['type']=='over']).abs().mean()
                     
@@ -201,7 +206,7 @@ def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_thres
                 st.write(f"Predicted O{target_line} probability: {target_prob:.4f}")
             else:
                 st.error(f"Could not find any suitable model for {book.upper()}.")
-
+    
     if not all_book_results:
         st.error("No data could be processed. Cannot provide a final prediction.")
         return
@@ -230,6 +235,10 @@ def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_thres
 
     # --- Visualization ---
     st.header("Visualization")
+    if not all_market_data:
+        st.warning("No data available for plotting.")
+        return
+        
     fig, ax = plt.subplots(figsize=(10, 6))
     full_market_df = pd.concat(all_market_data)
     colors = {'fd': 'blue', 'dk': 'green'}
@@ -245,7 +254,9 @@ def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_thres
         model_probs = [get_prob_from_model(res['params'], l, res['model']) for l in plot_lines]
         ax.plot(plot_lines, model_probs, color=colors.get(res['book'], 'gray'), ls=line_style, label=f"{res['book'].upper()} {res['model'].capitalize()} Fit{label_suffix}")
 
-    ax.scatter(anchor_line, anchor_fair_prob, c='red', s=200, marker='*', label=f'Anchor: Over {anchor_line} @ {anchor_odds:+.0f}', zorder=5)
+    if use_anchor:
+        ax.scatter(anchor_line, anchor_fair_prob, c='red', s=200, marker='*', label=f'Anchor: Over {anchor_line} @ {anchor_odds:+.0f}', zorder=5)
+    
     ax.axvline(x=target_line, color='purple', linestyle=':', label=f'Target Line: {target_line}')
     if not reliable_results_df.empty:
         avg_fair_prob_over = reliable_results_df['target_prob_over'].mean()
@@ -272,30 +283,34 @@ def run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_thres
 st.set_page_config(layout="wide")
 st.title("🎯 Derivative Prop Line Calculator")
 
-# --- Sidebar for Inputs ---
 with st.sidebar:
     st.header("1. Upload Data")
     uploaded_file = st.file_uploader("Upload your CSV file", type="csv")
     
     st.header("2. Set Parameters")
-    anchor_line = st.number_input("Anchor Line", value=21.5, step=1.0, format="%.1f")
-    anchor_odds = st.number_input("Anchor Odds (American)", value=109)
+    
+    use_anchor = st.checkbox("Use Anchor Point for Calibration", value=True)
+    
+    if use_anchor:
+        anchor_line = st.number_input("Anchor Line", value=21.5, step=1.0, format="%.1f")
+        anchor_odds = st.number_input("Anchor Odds (American)", value=109)
+    else:
+        anchor_line = 0
+        anchor_odds = 0
+        
     target_line = st.number_input("Target Line", value=18.5, step=1.0, format="%.1f")
     dist_type = st.radio("Distribution Type", ('Discrete', 'Continuous'))
     mae_threshold = st.slider("Max MAE Threshold", min_value=0.01, max_value=0.1, value=DEFAULT_MAE_THRESHOLD, step=0.01, format="%.2f")
 
-# --- Main Page Logic ---
 if uploaded_file is not None:
     try:
-        # Read the uploaded file into a dataframe
         df = pd.read_csv(uploaded_file, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8-sig')
-        
         st.header("Data Preview")
         st.dataframe(df.head())
 
         if st.button("Run Analysis", use_container_width=True):
             with st.spinner("Calculating..."):
-                run_analysis(df, anchor_line, anchor_odds, target_line, dist_type, mae_threshold)
+                run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold)
 
     except Exception as e:
         st.error(f"An error occurred while reading or processing the file: {e}")
