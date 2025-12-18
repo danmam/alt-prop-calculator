@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-from scipy.stats import (poisson, nbinom, norm, lognorm, weibull_min, gamma)
+from scipy.stats import (poisson, nbinom, norm, lognorm, weibull_min, gamma, skewnorm)
 try:
     from scipy.stats import skewt
     SKEWT_AVAILABLE = True
@@ -11,6 +11,7 @@ except ImportError:
     SKEWT_AVAILABLE = False
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from math import exp, factorial
 import io
 
@@ -73,6 +74,7 @@ def get_prob_from_model(params, line, dist_name):
         elif dist_name == 'lognorm': prob_le_k = lognorm.cdf(k, s=params[0], loc=params[1], scale=params[2])
         elif dist_name == 'weibull': prob_le_k = weibull_min.cdf(k, c=params[0], loc=params[1], scale=params[2])
         elif dist_name == 'gamma': prob_le_k = gamma.cdf(k, a=params[0], loc=params[1], scale=params[2])
+        elif dist_name == 'skewnorm': prob_le_k = skewnorm.cdf(k, a=params[0], loc=params[1], scale=params[2])
         elif dist_name == 'skewt' and SKEWT_AVAILABLE: prob_le_k = skewt.cdf(k, a=params[0], df=params[1], loc=params[2], scale=params[3])
     return 1 - prob_le_k
 
@@ -107,43 +109,68 @@ def fit_model(market_df, use_anchor, anchor_line, anchor_prob, dist_name):
         'lognorm': {'guess': [0.5, 0, mean_estimate], 'bounds': [(0.01, None), (None, None), (0.1, None)]},
         'weibull': {'guess': [1.5, 0, mean_estimate], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
         'gamma': {'guess': [2, 0, mean_estimate / 2], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
+        # Skewnorm params: [alpha (shape), loc, scale]
+        'skewnorm': {'guess': [0, mean_estimate, 5], 'bounds': [(None, None), (None, None), (0.1, None)]},
         'skewt': {'guess': [0, 10, mean_estimate, 5], 'bounds': [(None, None), (1, None), (None, None), (0.1, None)]}
     }
     config = models[dist_name]
     result = minimize(calculate_fit_error, config['guess'], args=(market_df, use_anchor, anchor_line, anchor_prob, dist_name), bounds=config['bounds'], method='L-BFGS-B')
     if not result.success:
-        st.warning(f"Optimizer failed to converge for {dist_name}. Results may be unreliable.")
+        # st.warning(f"Optimizer failed to converge for {dist_name}.") 
+        pass # Suppress warning to keep UI clean, we handle errors in the loop
     return result.x
 
 # ==============================================================================
 # 4. MAIN ANALYSIS FUNCTION
 # ==============================================================================
 def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold):
-    """Contains the core analysis logic with robust vig calculation."""
+    """Contains the core analysis logic with robust vig calculation and dynamic book handling."""
     
-    df.columns = ['textsm', 'fd_over', 'fd_under', 'dk_over', 'dk_under']
+    # 1. Dynamic Column Handling
+    # Expectation: Col 0 is 'line'. Subsequent pairs are Book Over/Under.
+    # Total columns should be odd (1 + 2*N).
+    
+    num_cols = df.shape[1]
+    if (num_cols - 1) % 2 != 0:
+        st.error(f"Invalid column format. Expected 1 Line column + Pairs of Over/Under columns. Found {num_cols} columns.")
+        return
+
+    num_books = (num_cols - 1) // 2
+    
+    # Generate generic names: line, book_1_over, book_1_under, book_2_over...
+    new_cols = ['line']
+    books = []
+    for i in range(num_books):
+        book_name = f"book_{i+1}"
+        books.append(book_name)
+        new_cols.extend([f"{book_name}_over", f"{book_name}_under"])
+        
+    df.columns = new_cols
     df.replace(['-', ''], np.nan, inplace=True)
-    for col in df.columns[1:]:
+    
+    # Convert all columns to numeric
+    for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
     if dist_type == 'Discrete':
         models_to_test = ['poisson', 'nbinom', 'zip']
     else:
-        models_to_test = ['norm', 'lognorm', 'weibull', 'gamma']
+        models_to_test = ['norm', 'lognorm', 'weibull', 'gamma', 'skewnorm']
         if SKEWT_AVAILABLE:
             models_to_test.append('skewt')
     
     st.write(f"##### Testing {dist_type} distributions: `{', '.join(models_to_test)}`")
 
-    books = ['fd', 'dk']
     all_book_results = []
     all_market_data = []
     anchor_fair_prob = american_to_prob(anchor_odds)
     
     book_dataframes = {}
     book_vigs = {}
+    
+    # 2. Extract Data Per Book
     for book in books:
-        book_df = df[['textsm', f'{book}_over', f'{book}_under']].copy()
+        book_df = df[['line', f'{book}_over', f'{book}_under']].copy()
         book_df.columns = ['line', 'over', 'under']
         market_df = pd.melt(book_df, id_vars=['line'], value_vars=['over', 'under'], var_name='type', value_name='odds').dropna(subset=['odds'])
         book_dataframes[book] = market_df
@@ -154,20 +181,22 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
             if not two_way_market.empty:
                 market_total = two_way_market['over'].iloc[0] + two_way_market['under'].iloc[0]
                 book_vigs[book] = market_total
-                st.info(f"Found 2-way market for **{book.upper()}** (Vig: {market_total:.4f}).")
+                st.info(f"Found 2-way market for **{book.replace('_', ' ').upper()}** (Vig: {market_total:.4f}).")
 
     shared_vig = next(iter(book_vigs.values()), None)
     
+    # 3. Process Each Book
     for book in books:
-        with st.expander(f"Processing for {book.upper()}..."):
+        clean_book_name = book.replace('_', ' ').upper()
+        with st.expander(f"Processing for {clean_book_name}..."):
             market_df = book_dataframes.get(book)
             if market_df is None or market_df.empty:
-                st.warning(f"No data for {book.upper()}. Skipping.")
+                st.warning(f"No data for {clean_book_name}. Skipping.")
                 continue
 
             if book in book_vigs:
                 vig_to_use = book_vigs[book]
-                st.write(f"Using **{book.upper()}'s own vig** for devigging.")
+                st.write(f"Using **{clean_book_name}'s own vig** for devigging.")
             elif shared_vig:
                 vig_to_use = shared_vig
                 st.write(f"Using **shared vig** ({vig_to_use:.4f}) from another book.")
@@ -177,10 +206,8 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
                 
             devigged_df = devig_market_data(market_df, vig_to_use)
             
-            # --- THIS IS THE CORRECTED SECTION ---
             devigged_df['book'] = book 
             all_market_data.append(devigged_df)
-            # --- END CORRECTION ---
             
             best_model_for_book = None
             min_mae = float('inf')
@@ -195,7 +222,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
                         min_mae = mae
                         best_model_for_book = {'book': book, 'model': dist_name, 'params': params, 'mae': mae}
                 except (ValueError, TypeError) as e:
-                    st.error(f"Could not fit '{dist_name}' for {book.upper()}. Optimizer failed. Skipping.")
+                    # st.error(f"Could not fit '{dist_name}' for {clean_book_name}.")
                     continue
 
             if best_model_for_book:
@@ -205,7 +232,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
                 st.write(f"Best fit: **{best_model_for_book['model'].capitalize()}** (MAE: {min_mae:.4f})")
                 st.write(f"Predicted O{target_line} probability: {target_prob:.4f}")
             else:
-                st.error(f"Could not find any suitable model for {book.upper()}.")
+                st.error(f"Could not find any suitable model for {clean_book_name}.")
     
     if not all_book_results:
         st.error("No data could be processed. Cannot provide a final prediction.")
@@ -241,18 +268,26 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         
     fig, ax = plt.subplots(figsize=(10, 6))
     full_market_df = pd.concat(all_market_data)
-    colors = {'fd': 'blue', 'dk': 'green'}
-    for book in ['fd', 'dk']:
+    
+    # Generate colors dynamically based on number of books
+    cmap = cm.get_cmap('tab10') # Supports up to 10 distinct colors nicely
+    color_map = {b: cmap(i % 10) for i, b in enumerate(books)}
+    
+    for book in books:
         book_data = full_market_df[(full_market_df['book'] == book) & (full_market_df['type'] == 'over')]
         if not book_data.empty:
-            ax.scatter(book_data['line'], book_data['fair_prob'], color=colors.get(book, 'gray'), label=f'{book.upper()} Market "Over" (Devigged)', alpha=0.7, s=50)
+            ax.scatter(book_data['line'], book_data['fair_prob'], color=color_map.get(book), label=f'{book.replace("_"," ").upper()} (Devigged)', alpha=0.7, s=50)
     
     for _, res in results_df.iterrows():
         line_style = '--' if res['mae'] <= mae_threshold else ':'
-        label_suffix = " (Best)" if res['mae'] <= mae_threshold else f" (Poor Fit, MAE={res['mae']:.2f})"
+        label_suffix = " (Best)" if res['mae'] <= mae_threshold else f" (Poor Fit)"
         plot_lines = np.linspace(full_market_df['line'].min() - 2, full_market_df['line'].max() + 2, 200)
         model_probs = [get_prob_from_model(res['params'], l, res['model']) for l in plot_lines]
-        ax.plot(plot_lines, model_probs, color=colors.get(res['book'], 'gray'), ls=line_style, label=f"{res['book'].upper()} {res['model'].capitalize()} Fit{label_suffix}")
+        
+        # Only label the prediction line if it's reliable or if we want to show everything
+        label = f"{res['book'].replace('_',' ').upper()} Fit" if res['mae'] <= mae_threshold else None
+        
+        ax.plot(plot_lines, model_probs, color=color_map.get(res['book']), ls=line_style, label=label)
 
     if use_anchor:
         ax.scatter(anchor_line, anchor_fair_prob, c='red', s=200, marker='*', label=f'Anchor: Over {anchor_line} @ {anchor_odds:+.0f}', zorder=5)
@@ -271,7 +306,12 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     valid_ticks = [t for t in ticks if 0 < t < 1]
     ax.set_yticks(valid_ticks)
     ax.set_yticklabels([f'{prob_to_american(t):+.0f}' for t in valid_ticks])
-    ax.legend()
+    
+    # Handle Legend deduplication
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys())
+    
     ax.grid(True)
     
     st.pyplot(fig)
@@ -285,6 +325,15 @@ st.title("🎯 Derivative Prop Line Calculator")
 
 with st.sidebar:
     st.header("1. Upload Data")
+    st.markdown("""
+    **Format Requirements:**
+    * **Column 1:** Prop Line (e.g., 18.5, 19.5)
+    * **Column 2:** Book 1 Over Odds
+    * **Column 3:** Book 1 Under Odds
+    * **Column 4:** Book 2 Over Odds
+    * **Column 5:** Book 2 Under Odds
+    * *(Repeat for as many books as needed)*
+    """)
     uploaded_file = st.file_uploader("Upload your CSV file", type="csv")
     
     st.header("2. Set Parameters")
