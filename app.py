@@ -61,14 +61,10 @@ def devig_market_data(df, market_total=None, method='multiplicative'):
             df['fair_prob'] = df['prob'] / market_total
         elif method == 'additive':
             # Additive: P_fair = P_raw - (Vig - 1) / 2
-            # This assumes equal vig distribution on both sides of a 2-way, 
-            # applied constantly to 1-way lines.
             vig_diff = (market_total - 1) / 2
             df['fair_prob'] = df['prob'] - vig_diff
-            # Clip to ensure valid probabilities (though unlikely to hit < 0 in standard props)
             df['fair_prob'] = df['fair_prob'].clip(lower=0.001, upper=0.999)
     else:
-        # st.warning("Proceeding without devigging.")
         df['fair_prob'] = df['prob']
     return df
 
@@ -134,7 +130,6 @@ def solve_location_shift(params, dist_name, target_line, target_prob):
     Shifts the location parameter of a distribution so that P(X > target_line) = target_prob.
     Keeps shape and scale parameters constant (Analysis 3 - Shape Retention).
     """
-    # Helper to reconstruct params with new loc
     def make_params(loc_val):
         p = list(params)
         if dist_name == 'norm': p[0] = loc_val
@@ -148,17 +143,13 @@ def solve_location_shift(params, dist_name, target_line, target_prob):
     def objective(loc_val):
         return get_prob_from_model(make_params(loc_val), target_line, dist_name) - target_prob
 
-    # Bracket search for root
     try:
-        # Initial guess is the current loc
         current_loc = params[0] if dist_name == 'norm' else params[1] if dist_name in ['lognorm', 'weibull', 'gamma', 'skewnorm'] else params[2]
-        
-        # Simple search for bounds
         a, b = current_loc - 20, current_loc + 20
         new_loc = brentq(objective, a, b)
         return make_params(new_loc)
     except:
-        return params # Fallback if solver fails
+        return params 
 
 # ==============================================================================
 # 4. MAIN ANALYSIS FUNCTION
@@ -198,13 +189,13 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
 
     # Data collection
     all_results = []
-    plot_data = [] # Stores (book, method, params, dist_name) for plotting
+    plot_data = [] 
 
     anchor_fair_prob_user = american_to_prob(anchor_odds)
     
     book_dataframes = {}
     book_vigs = {}
-    book_main_lines = {} # Store the specific line and fair prob for Analysis 3
+    book_main_lines = {} 
     
     # 2. Extract Data Per Book & Find Vigs
     for book in books:
@@ -217,15 +208,12 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         if 'over' in pivot.columns and 'under' in pivot.columns:
             two_way_market = pivot[['over', 'under']].dropna().applymap(american_to_prob)
             if not two_way_market.empty:
-                # Calculate vig from the first available 2-way line
                 over_prob = two_way_market['over'].iloc[0]
                 under_prob = two_way_market['under'].iloc[0]
                 market_total = over_prob + under_prob
                 book_vigs[book] = market_total
                 
-                # Store main line details for Analysis 3 (Shape Retention)
                 main_line_val = two_way_market.index[0]
-                # Fair prob for main line is typically Multiplicative devig
                 main_line_fair = over_prob / market_total 
                 book_main_lines[book] = {'line': main_line_val, 'fair_prob': main_line_fair}
                 
@@ -252,50 +240,37 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
                 best_model = None
                 min_mae = float('inf')
                 
-                # --- PREPARE DATA ---
                 working_df = market_df.copy()
                 
                 if analysis_type == 'Additive':
-                    # Method 1: Constant Vig Subtraction
                     working_df = devig_market_data(working_df, vig_to_use, method='additive')
                     target_col = 'fair_prob'
-                    fit_anchor_prob = anchor_fair_prob_user # Use user anchor for fitting
+                    fit_anchor_prob = anchor_fair_prob_user 
                     
                 elif analysis_type == 'Multiplicative':
-                    # Method 2: Constant Ratio Division (Standard)
                     working_df = devig_market_data(working_df, vig_to_use, method='multiplicative')
                     target_col = 'fair_prob'
                     fit_anchor_prob = anchor_fair_prob_user
                     
                 elif analysis_type == 'Shape Retention':
-                    # Method 3: Fit Raw, then Shift
-                    # We treat 'prob' (raw) as the target for the initial fit
                     working_df['prob'] = working_df['odds'].apply(american_to_prob)
                     target_col = 'prob'
-                    fit_anchor_prob = None # Don't anchor to user point during raw fit
+                    fit_anchor_prob = None 
                 
-                # --- FIT MODELS ---
                 for dist_name in models_to_test:
                     try:
-                        # 1. Fit
                         params = fit_model(working_df, use_anchor if analysis_type != 'Shape Retention' else False, 
                                          anchor_line, fit_anchor_prob, dist_name, target_col)
                         if params is None: continue
 
-                        # 2. Process / Shift based on Method
                         final_params = params
                         
                         if analysis_type == 'Shape Retention':
-                            # Step A: Shift to remove vig (Anchor to Main Line Fair Prob)
                             if main_line_info:
                                 final_params = solve_location_shift(final_params, dist_name, main_line_info['line'], main_line_info['fair_prob'])
-                            
-                            # Step B: Shift to User Anchor (Calibration)
                             if use_anchor:
                                 final_params = solve_location_shift(final_params, dist_name, anchor_line, anchor_fair_prob_user)
                         
-                        # 3. Calculate Error (MAE) against Fair Data (Devigged via Multiplicative for standardized comparison)
-                        # Note: For Shape Retention, we compare the shifted model against standard devigged points to see fit quality
                         comparison_df = devig_market_data(market_df.copy(), vig_to_use, method='multiplicative')
                         model_probs = comparison_df['line'].apply(lambda x: get_prob_from_model(final_params, x, dist_name))
                         mae = (comparison_df[comparison_df['type']=='over']['fair_prob'] - model_probs[comparison_df['type']=='over']).abs().mean()
@@ -307,27 +282,37 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
                     except Exception as e:
                         continue
 
-                # --- STORE RESULTS ---
                 if best_model:
                     target_prob = get_prob_from_model(best_model['params'], target_line, best_model['model'])
                     best_model['target_prob_over'] = target_prob
                     all_results.append(best_model)
                     plot_data.append(best_model)
     
-    # --- OUTPUT RESULTS ---
     if not all_results:
         st.error("No valid models found.")
         return
 
     res_df = pd.DataFrame(all_results)
     
-    st.header("Comparative Results")
-    st.write("Comparison of Fair Odds for Target Line using different devigging methodologies:")
+    # --- AVERAGES SECTION ---
+    st.markdown("### 📊 Average Fair Odds by Method")
+    avg_methods = res_df.groupby('method')['target_prob_over'].mean()
     
-    # Pivot for clean display
+    col1, col2, col3 = st.columns(3)
+    cols = [col1, col2, col3]
+    
+    # Ensure specific order if possible, otherwise iterate
+    order = ['Additive', 'Multiplicative', 'Shape Retention']
+    for i, method in enumerate(order):
+        if method in avg_methods:
+            avg_prob = avg_methods[method]
+            with cols[i]:
+                st.metric(f"{method} Avg", f"{prob_to_american(avg_prob):+.0f}", f"{avg_prob:.1%}")
+
+    # --- DATAFRAME ---
+    st.write("---")
+    st.write("**Detailed Breakdown by Book:**")
     display_df = res_df.pivot_table(index='book', columns='method', values='target_prob_over', aggfunc='first')
-    
-    # Add formatting
     formatted_df = display_df.applymap(lambda p: f"{prob_to_american(p):+.0f} ({p:.1%})")
     st.dataframe(formatted_df)
 
@@ -335,41 +320,67 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     st.header("Visual Comparison")
     fig, ax = plt.subplots(figsize=(12, 7))
     
-    # Plot Scatter Points (Standard Multiplicative Devig for reference)
     cmap = cm.get_cmap('tab10')
     colors = {b: cmap(i) for i, b in enumerate(books)}
     styles = {'Additive': ':', 'Multiplicative': '--', 'Shape Retention': '-'}
     
+    # 1. Plot Data Points
     for book in books:
-        # Plot data points (using Multiplicative devig as visual baseline)
         m_df = book_dataframes[book].copy()
         vig = book_vigs.get(book, DEFAULT_VIG_MARKET_TOTAL)
-        m_df = devig_market_data(m_df, vig, method='multiplicative')
-        over_data = m_df[m_df['type']=='over']
-        ax.scatter(over_data['line'], over_data['fair_prob'], color=colors[book], alpha=0.3, label=f"{book} Data (Ref)")
+        
+        # Plot RAW (With Vig)
+        m_df['raw_prob'] = m_df['odds'].apply(american_to_prob)
+        raw_over = m_df[m_df['type']=='over']
+        ax.scatter(raw_over['line'], raw_over['raw_prob'], color=colors[book], marker='x', s=80, alpha=0.8, label=f"{book.replace('_',' ').upper()} Raw (With Vig)")
+        
+        # Plot DEVIGGED (Without Vig - Multiplicative Ref)
+        devig_df = devig_market_data(m_df.copy(), vig, method='multiplicative')
+        devig_over = devig_df[devig_df['type']=='over']
+        ax.scatter(devig_over['line'], devig_over['fair_prob'], color=colors[book], marker='o', s=80, alpha=0.8, label=f"{book.replace('_',' ').upper()} Fair (No Vig)")
 
-    # Plot Curves
+    # 2. Plot Curves
     x_range = np.linspace(df['line'].min() - 2, df['line'].max() + 2, 200)
-    
     for res in plot_data:
-        # Only plot if MAE is reasonable to avoid clutter
         if res['mae'] <= mae_threshold * 1.5: 
             y_vals = [get_prob_from_model(res['params'], x, res['model']) for x in x_range]
             c = colors[res['book']]
             s = styles[res['method']]
-            lbl = f"{res['book']} {res['method']} ({res['model']})"
+            lbl = f"{res['book']} {res['method']}"
             ax.plot(x_range, y_vals, color=c, linestyle=s, label=lbl, linewidth=2 if res['method'] == 'Shape Retention' else 1.5)
 
     if use_anchor:
-        ax.scatter(anchor_line, anchor_fair_prob_user, c='red', s=150, marker='*', label='Anchor Point', zorder=10)
+        ax.scatter(anchor_line, anchor_fair_prob_user, c='red', s=200, marker='*', label='Anchor Point', zorder=10)
         
     ax.axvline(target_line, color='black', alpha=0.3, linestyle='-')
-    ax.set_title("Methodology Comparison: Shape Retention vs. Standard Devig")
-    ax.set_xlabel("Line")
-    ax.set_ylabel("Fair Probability (Over)")
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax.grid(True, alpha=0.3)
     
+    # --- DUAL AXIS SETUP ---
+    ax.set_title("Market Analysis: Raw vs. Fair Value Models")
+    ax.set_xlabel("Line")
+    
+    # Left Y-Axis: American Odds (Primary Control)
+    ax.set_ylabel("American Odds (Fair)", fontsize=12, fontweight='bold')
+    ax.set_ylim(0.02, 0.98)
+    
+    # Create ticks for Odds
+    major_ticks = np.arange(0.1, 1.0, 0.1)
+    ax.set_yticks(major_ticks)
+    ax.set_yticklabels([f'{prob_to_american(t):+.0f}' for t in major_ticks])
+    
+    # Right Y-Axis: Probability (Secondary)
+    ax2 = ax.twinx()
+    ax2.set_ylabel("Probability (%)", fontsize=12)
+    ax2.set_ylim(0.02, 0.98)
+    ax2.set_yticks(major_ticks)
+    ax2.set_yticklabels([f'{t:.0%}' for t in major_ticks])
+    
+    # Legend - Remove duplicates
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.08, 1), loc='upper left')
+    
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
     st.pyplot(fig)
 
 # ==============================================================================
