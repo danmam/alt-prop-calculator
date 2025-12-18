@@ -9,11 +9,10 @@ try:
     SKEWT_AVAILABLE = True
 except ImportError:
     SKEWT_AVAILABLE = False
-from scipy.optimize import minimize
+from scipy.optimize import minimize, brentq
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from math import exp, factorial
-import io
 
 # ==============================================================================
 # 0. CONFIGURATION
@@ -50,14 +49,26 @@ def zip_cdf(k, pi, lam):
             return 1.0
     return cdf_val
 
-def devig_market_data(df, market_total=None):
-    """Applies a given market_total (vig) to a dataframe."""
+def devig_market_data(df, market_total=None, method='multiplicative'):
+    """
+    Applies a given market_total (vig) to a dataframe.
+    method: 'multiplicative' (divide by vig) or 'additive' (subtract half-vig).
+    """
     df['prob'] = df['odds'].apply(american_to_prob)
     
     if market_total:
-        df['fair_prob'] = df['prob'] / market_total
+        if method == 'multiplicative':
+            df['fair_prob'] = df['prob'] / market_total
+        elif method == 'additive':
+            # Additive: P_fair = P_raw - (Vig - 1) / 2
+            # This assumes equal vig distribution on both sides of a 2-way, 
+            # applied constantly to 1-way lines.
+            vig_diff = (market_total - 1) / 2
+            df['fair_prob'] = df['prob'] - vig_diff
+            # Clip to ensure valid probabilities (though unlikely to hit < 0 in standard props)
+            df['fair_prob'] = df['fair_prob'].clip(lower=0.001, upper=0.999)
     else:
-        st.warning("Proceeding without devigging.")
+        # st.warning("Proceeding without devigging.")
         df['fair_prob'] = df['prob']
     return df
 
@@ -78,26 +89,26 @@ def get_prob_from_model(params, line, dist_name):
         elif dist_name == 'skewt' and SKEWT_AVAILABLE: prob_le_k = skewt.cdf(k, a=params[0], df=params[1], loc=params[2], scale=params[3])
     return 1 - prob_le_k
 
-def calculate_fit_error(params, market_df, use_anchor, anchor_line, anchor_prob, dist_name):
+def calculate_fit_error(params, market_df, use_anchor, anchor_line, anchor_prob, dist_name, target_col='fair_prob'):
     """Generic error function, with optional anchor point."""
     if any(pd.isna(params)): return 1e9
     
     total_error = 0
     over_data = market_df[market_df['type'] == 'over']
     model_probs = over_data['line'].apply(lambda x: get_prob_from_model(params, x, dist_name))
-    total_error = np.sum((model_probs - over_data['fair_prob'])**2)
+    total_error = np.sum((model_probs - over_data[target_col])**2)
     
     anchor_error = 0
-    if use_anchor:
+    if use_anchor and anchor_prob is not None:
         anchor_model_prob = get_prob_from_model(params, anchor_line, dist_name)
         anchor_error = (anchor_model_prob - anchor_prob)**2
     
     return total_error + 100 * anchor_error
 
-def fit_model(market_df, use_anchor, anchor_line, anchor_prob, dist_name):
+def fit_model(market_df, use_anchor, anchor_line, anchor_prob, dist_name, target_col='fair_prob'):
     """Finds the best-fit parameters for any given distribution."""
     if not use_anchor and not market_df.empty:
-        mean_estimate = market_df.iloc[(market_df['fair_prob']-0.5).abs().argsort()[:1]]['line'].values[0]
+        mean_estimate = market_df.iloc[(market_df[target_col]-0.5).abs().argsort()[:1]]['line'].values[0]
     else:
         mean_estimate = anchor_line
 
@@ -109,16 +120,45 @@ def fit_model(market_df, use_anchor, anchor_line, anchor_prob, dist_name):
         'lognorm': {'guess': [0.5, 0, mean_estimate], 'bounds': [(0.01, None), (None, None), (0.1, None)]},
         'weibull': {'guess': [1.5, 0, mean_estimate], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
         'gamma': {'guess': [2, 0, mean_estimate / 2], 'bounds': [(0.1, None), (None, None), (0.1, None)]},
-        # Skewnorm params: [alpha (shape), loc, scale]
         'skewnorm': {'guess': [0, mean_estimate, 5], 'bounds': [(None, None), (None, None), (0.1, None)]},
         'skewt': {'guess': [0, 10, mean_estimate, 5], 'bounds': [(None, None), (1, None), (None, None), (0.1, None)]}
     }
     config = models[dist_name]
-    result = minimize(calculate_fit_error, config['guess'], args=(market_df, use_anchor, anchor_line, anchor_prob, dist_name), bounds=config['bounds'], method='L-BFGS-B')
+    result = minimize(calculate_fit_error, config['guess'], args=(market_df, use_anchor, anchor_line, anchor_prob, dist_name, target_col), bounds=config['bounds'], method='L-BFGS-B')
     if not result.success:
-        # st.warning(f"Optimizer failed to converge for {dist_name}.") 
-        pass # Suppress warning to keep UI clean, we handle errors in the loop
+        return None
     return result.x
+
+def solve_location_shift(params, dist_name, target_line, target_prob):
+    """
+    Shifts the location parameter of a distribution so that P(X > target_line) = target_prob.
+    Keeps shape and scale parameters constant (Analysis 3 - Shape Retention).
+    """
+    # Helper to reconstruct params with new loc
+    def make_params(loc_val):
+        p = list(params)
+        if dist_name == 'norm': p[0] = loc_val
+        elif dist_name == 'lognorm': p[1] = loc_val
+        elif dist_name == 'weibull': p[1] = loc_val
+        elif dist_name == 'gamma': p[1] = loc_val
+        elif dist_name == 'skewnorm': p[1] = loc_val
+        elif dist_name == 'skewt': p[2] = loc_val
+        return p
+
+    def objective(loc_val):
+        return get_prob_from_model(make_params(loc_val), target_line, dist_name) - target_prob
+
+    # Bracket search for root
+    try:
+        # Initial guess is the current loc
+        current_loc = params[0] if dist_name == 'norm' else params[1] if dist_name in ['lognorm', 'weibull', 'gamma', 'skewnorm'] else params[2]
+        
+        # Simple search for bounds
+        a, b = current_loc - 20, current_loc + 20
+        new_loc = brentq(objective, a, b)
+        return make_params(new_loc)
+    except:
+        return params # Fallback if solver fails
 
 # ==============================================================================
 # 4. MAIN ANALYSIS FUNCTION
@@ -127,9 +167,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     """Contains the core analysis logic with robust vig calculation and dynamic book handling."""
     
     # 1. Dynamic Column Handling
-    # Expectation: Col 0 is 'line'. Subsequent pairs are Book Over/Under.
-    # Total columns should be odd (1 + 2*N).
-    
     num_cols = df.shape[1]
     if (num_cols - 1) % 2 != 0:
         st.error(f"Invalid column format. Expected 1 Line column + Pairs of Over/Under columns. Found {num_cols} columns.")
@@ -137,7 +174,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
 
     num_books = (num_cols - 1) // 2
     
-    # Generate generic names: line, book_1_over, book_1_under, book_2_over...
     new_cols = ['line']
     books = []
     for i in range(num_books):
@@ -148,7 +184,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     df.columns = new_cols
     df.replace(['-', ''], np.nan, inplace=True)
     
-    # Convert all columns to numeric
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
@@ -161,14 +196,17 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     
     st.write(f"##### Testing {dist_type} distributions: `{', '.join(models_to_test)}`")
 
-    all_book_results = []
-    all_market_data = []
-    anchor_fair_prob = american_to_prob(anchor_odds)
+    # Data collection
+    all_results = []
+    plot_data = [] # Stores (book, method, params, dist_name) for plotting
+
+    anchor_fair_prob_user = american_to_prob(anchor_odds)
     
     book_dataframes = {}
     book_vigs = {}
+    book_main_lines = {} # Store the specific line and fair prob for Analysis 3
     
-    # 2. Extract Data Per Book
+    # 2. Extract Data Per Book & Find Vigs
     for book in books:
         book_df = df[['line', f'{book}_over', f'{book}_under']].copy()
         book_df.columns = ['line', 'over', 'under']
@@ -179,140 +217,158 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         if 'over' in pivot.columns and 'under' in pivot.columns:
             two_way_market = pivot[['over', 'under']].dropna().applymap(american_to_prob)
             if not two_way_market.empty:
-                market_total = two_way_market['over'].iloc[0] + two_way_market['under'].iloc[0]
+                # Calculate vig from the first available 2-way line
+                over_prob = two_way_market['over'].iloc[0]
+                under_prob = two_way_market['under'].iloc[0]
+                market_total = over_prob + under_prob
                 book_vigs[book] = market_total
-                st.info(f"Found 2-way market for **{book.replace('_', ' ').upper()}** (Vig: {market_total:.4f}).")
+                
+                # Store main line details for Analysis 3 (Shape Retention)
+                main_line_val = two_way_market.index[0]
+                # Fair prob for main line is typically Multiplicative devig
+                main_line_fair = over_prob / market_total 
+                book_main_lines[book] = {'line': main_line_val, 'fair_prob': main_line_fair}
+                
+                st.info(f"Found 2-way market for **{book.replace('_', ' ').upper()}** @ {main_line_val} (Vig: {market_total:.4f}).")
 
     shared_vig = next(iter(book_vigs.values()), None)
     
-    # 3. Process Each Book
+    # 3. Process Each Book with 3 Analyses
+    analyses = ['Additive', 'Multiplicative', 'Shape Retention']
+    
     for book in books:
         clean_book_name = book.replace('_', ' ').upper()
-        with st.expander(f"Processing for {clean_book_name}..."):
-            market_df = book_dataframes.get(book)
-            if market_df is None or market_df.empty:
-                st.warning(f"No data for {clean_book_name}. Skipping.")
-                continue
+        market_df = book_dataframes.get(book)
+        
+        if market_df is None or market_df.empty:
+            continue
+            
+        vig_to_use = book_vigs.get(book, shared_vig if shared_vig else DEFAULT_VIG_MARKET_TOTAL)
+        main_line_info = book_main_lines.get(book)
 
-            if book in book_vigs:
-                vig_to_use = book_vigs[book]
-                st.write(f"Using **{clean_book_name}'s own vig** for devigging.")
-            elif shared_vig:
-                vig_to_use = shared_vig
-                st.write(f"Using **shared vig** ({vig_to_use:.4f}) from another book.")
-            else:
-                vig_to_use = DEFAULT_VIG_MARKET_TOTAL
-                st.warning(f"No 2-way market found. Using **default vig** of {vig_to_use:.4f}.")
+        with st.expander(f"Analysis for {clean_book_name}", expanded=True):
+            
+            for analysis_type in analyses:
+                best_model = None
+                min_mae = float('inf')
                 
-            devigged_df = devig_market_data(market_df, vig_to_use)
-            
-            devigged_df['book'] = book 
-            all_market_data.append(devigged_df)
-            
-            best_model_for_book = None
-            min_mae = float('inf')
-
-            for dist_name in models_to_test:
-                try:
-                    params = fit_model(devigged_df, use_anchor, anchor_line, anchor_fair_prob, dist_name)
-                    model_probs = devigged_df['line'].apply(lambda x: get_prob_from_model(params, x, dist_name))
-                    mae = (devigged_df[devigged_df['type']=='over']['fair_prob'] - model_probs[devigged_df['type']=='over']).abs().mean()
+                # --- PREPARE DATA ---
+                working_df = market_df.copy()
+                
+                if analysis_type == 'Additive':
+                    # Method 1: Constant Vig Subtraction
+                    working_df = devig_market_data(working_df, vig_to_use, method='additive')
+                    target_col = 'fair_prob'
+                    fit_anchor_prob = anchor_fair_prob_user # Use user anchor for fitting
                     
-                    if mae < min_mae:
-                        min_mae = mae
-                        best_model_for_book = {'book': book, 'model': dist_name, 'params': params, 'mae': mae}
-                except (ValueError, TypeError) as e:
-                    # st.error(f"Could not fit '{dist_name}' for {clean_book_name}.")
-                    continue
+                elif analysis_type == 'Multiplicative':
+                    # Method 2: Constant Ratio Division (Standard)
+                    working_df = devig_market_data(working_df, vig_to_use, method='multiplicative')
+                    target_col = 'fair_prob'
+                    fit_anchor_prob = anchor_fair_prob_user
+                    
+                elif analysis_type == 'Shape Retention':
+                    # Method 3: Fit Raw, then Shift
+                    # We treat 'prob' (raw) as the target for the initial fit
+                    working_df['prob'] = working_df['odds'].apply(american_to_prob)
+                    target_col = 'prob'
+                    fit_anchor_prob = None # Don't anchor to user point during raw fit
+                
+                # --- FIT MODELS ---
+                for dist_name in models_to_test:
+                    try:
+                        # 1. Fit
+                        params = fit_model(working_df, use_anchor if analysis_type != 'Shape Retention' else False, 
+                                         anchor_line, fit_anchor_prob, dist_name, target_col)
+                        if params is None: continue
 
-            if best_model_for_book:
-                target_prob = get_prob_from_model(best_model_for_book['params'], target_line, best_model_for_book['model'])
-                best_model_for_book['target_prob_over'] = target_prob
-                all_book_results.append(best_model_for_book)
-                st.write(f"Best fit: **{best_model_for_book['model'].capitalize()}** (MAE: {min_mae:.4f})")
-                st.write(f"Predicted O{target_line} probability: {target_prob:.4f}")
-            else:
-                st.error(f"Could not find any suitable model for {clean_book_name}.")
-    
-    if not all_book_results:
-        st.error("No data could be processed. Cannot provide a final prediction.")
-        return
-    
-    results_df = pd.DataFrame(all_book_results)
-    reliable_results_df = results_df[results_df['mae'] <= mae_threshold].copy()
-    
-    st.header("Final Results")
-    st.write("Best fit model found for each book (all results):")
-    st.dataframe(results_df[['book', 'model', 'mae', 'target_prob_over']])
-    
-    if reliable_results_df.empty:
-        st.warning(f"No models met the quality threshold (MAE <= {mae_threshold}). Cannot provide a reliable final prediction.")
-    else:
-        avg_fair_prob_over = reliable_results_df['target_prob_over'].mean()
-        avg_fair_odds_over = prob_to_american(avg_fair_prob_over)
-        avg_fair_prob_under = 1 - avg_fair_prob_over
-        avg_fair_odds_under = prob_to_american(avg_fair_prob_under)
-        
-        st.subheader(f"Final Averaged Prediction for line {target_line}")
-        st.info(f"Based on **{len(reliable_results_df)}** reliable book(s) where MAE ≤ {mae_threshold}")
-        
-        col1, col2 = st.columns(2)
-        col1.metric("Fair Odds (Over)", f"{avg_fair_odds_over:+.0f}")
-        col2.metric("Fair Odds (Under)", f"{avg_fair_odds_under:+.0f}")
+                        # 2. Process / Shift based on Method
+                        final_params = params
+                        
+                        if analysis_type == 'Shape Retention':
+                            # Step A: Shift to remove vig (Anchor to Main Line Fair Prob)
+                            if main_line_info:
+                                final_params = solve_location_shift(final_params, dist_name, main_line_info['line'], main_line_info['fair_prob'])
+                            
+                            # Step B: Shift to User Anchor (Calibration)
+                            if use_anchor:
+                                final_params = solve_location_shift(final_params, dist_name, anchor_line, anchor_fair_prob_user)
+                        
+                        # 3. Calculate Error (MAE) against Fair Data (Devigged via Multiplicative for standardized comparison)
+                        # Note: For Shape Retention, we compare the shifted model against standard devigged points to see fit quality
+                        comparison_df = devig_market_data(market_df.copy(), vig_to_use, method='multiplicative')
+                        model_probs = comparison_df['line'].apply(lambda x: get_prob_from_model(final_params, x, dist_name))
+                        mae = (comparison_df[comparison_df['type']=='over']['fair_prob'] - model_probs[comparison_df['type']=='over']).abs().mean()
+                        
+                        if mae < min_mae:
+                            min_mae = mae
+                            best_model = {'book': book, 'method': analysis_type, 'model': dist_name, 'params': final_params, 'mae': mae}
+                            
+                    except Exception as e:
+                        continue
 
-    # --- Visualization ---
-    st.header("Visualization")
-    if not all_market_data:
-        st.warning("No data available for plotting.")
-        return
-        
-    fig, ax = plt.subplots(figsize=(10, 6))
-    full_market_df = pd.concat(all_market_data)
+                # --- STORE RESULTS ---
+                if best_model:
+                    target_prob = get_prob_from_model(best_model['params'], target_line, best_model['model'])
+                    best_model['target_prob_over'] = target_prob
+                    all_results.append(best_model)
+                    plot_data.append(best_model)
     
-    # Generate colors dynamically based on number of books
-    cmap = cm.get_cmap('tab10') # Supports up to 10 distinct colors nicely
-    color_map = {b: cmap(i % 10) for i, b in enumerate(books)}
+    # --- OUTPUT RESULTS ---
+    if not all_results:
+        st.error("No valid models found.")
+        return
+
+    res_df = pd.DataFrame(all_results)
+    
+    st.header("Comparative Results")
+    st.write("Comparison of Fair Odds for Target Line using different devigging methodologies:")
+    
+    # Pivot for clean display
+    display_df = res_df.pivot_table(index='book', columns='method', values='target_prob_over', aggfunc='first')
+    
+    # Add formatting
+    formatted_df = display_df.applymap(lambda p: f"{prob_to_american(p):+.0f} ({p:.1%})")
+    st.dataframe(formatted_df)
+
+    # --- VISUALIZATION ---
+    st.header("Visual Comparison")
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Plot Scatter Points (Standard Multiplicative Devig for reference)
+    cmap = cm.get_cmap('tab10')
+    colors = {b: cmap(i) for i, b in enumerate(books)}
+    styles = {'Additive': ':', 'Multiplicative': '--', 'Shape Retention': '-'}
     
     for book in books:
-        book_data = full_market_df[(full_market_df['book'] == book) & (full_market_df['type'] == 'over')]
-        if not book_data.empty:
-            ax.scatter(book_data['line'], book_data['fair_prob'], color=color_map.get(book), label=f'{book.replace("_"," ").upper()} (Devigged)', alpha=0.7, s=50)
+        # Plot data points (using Multiplicative devig as visual baseline)
+        m_df = book_dataframes[book].copy()
+        vig = book_vigs.get(book, DEFAULT_VIG_MARKET_TOTAL)
+        m_df = devig_market_data(m_df, vig, method='multiplicative')
+        over_data = m_df[m_df['type']=='over']
+        ax.scatter(over_data['line'], over_data['fair_prob'], color=colors[book], alpha=0.3, label=f"{book} Data (Ref)")
+
+    # Plot Curves
+    x_range = np.linspace(df['line'].min() - 2, df['line'].max() + 2, 200)
     
-    for _, res in results_df.iterrows():
-        line_style = '--' if res['mae'] <= mae_threshold else ':'
-        label_suffix = " (Best)" if res['mae'] <= mae_threshold else f" (Poor Fit)"
-        plot_lines = np.linspace(full_market_df['line'].min() - 2, full_market_df['line'].max() + 2, 200)
-        model_probs = [get_prob_from_model(res['params'], l, res['model']) for l in plot_lines]
-        
-        # Only label the prediction line if it's reliable or if we want to show everything
-        label = f"{res['book'].replace('_',' ').upper()} Fit" if res['mae'] <= mae_threshold else None
-        
-        ax.plot(plot_lines, model_probs, color=color_map.get(res['book']), ls=line_style, label=label)
+    for res in plot_data:
+        # Only plot if MAE is reasonable to avoid clutter
+        if res['mae'] <= mae_threshold * 1.5: 
+            y_vals = [get_prob_from_model(res['params'], x, res['model']) for x in x_range]
+            c = colors[res['book']]
+            s = styles[res['method']]
+            lbl = f"{res['book']} {res['method']} ({res['model']})"
+            ax.plot(x_range, y_vals, color=c, linestyle=s, label=lbl, linewidth=2 if res['method'] == 'Shape Retention' else 1.5)
 
     if use_anchor:
-        ax.scatter(anchor_line, anchor_fair_prob, c='red', s=200, marker='*', label=f'Anchor: Over {anchor_line} @ {anchor_odds:+.0f}', zorder=5)
-    
-    ax.axvline(x=target_line, color='purple', linestyle=':', label=f'Target Line: {target_line}')
-    if not reliable_results_df.empty:
-        avg_fair_prob_over = reliable_results_df['target_prob_over'].mean()
-        avg_fair_odds_over = prob_to_american(avg_fair_prob_over)
-        ax.axhline(y=avg_fair_prob_over, color='purple', linestyle=':', label=f'Final Avg. Odds: {avg_fair_odds_over:+.0f}')
-    
-    ax.set_title(f'Per-Book Model Fits ({dist_type} Distributions)', fontsize=16)
-    ax.set_xlabel('Player Prop Line', fontsize=12)
-    ax.set_ylabel('Fair American Odds ("Over")', fontsize=12)
-    ax.set_ylim(bottom=0.02, top=0.98) 
-    ticks = ax.get_yticks()
-    valid_ticks = [t for t in ticks if 0 < t < 1]
-    ax.set_yticks(valid_ticks)
-    ax.set_yticklabels([f'{prob_to_american(t):+.0f}' for t in valid_ticks])
-    
-    # Handle Legend deduplication
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys())
-    
-    ax.grid(True)
+        ax.scatter(anchor_line, anchor_fair_prob_user, c='red', s=150, marker='*', label='Anchor Point', zorder=10)
+        
+    ax.axvline(target_line, color='black', alpha=0.3, linestyle='-')
+    ax.set_title("Methodology Comparison: Shape Retention vs. Standard Devig")
+    ax.set_xlabel("Line")
+    ax.set_ylabel("Fair Probability (Over)")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True, alpha=0.3)
     
     st.pyplot(fig)
 
@@ -321,7 +377,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
 # ==============================================================================
 
 st.set_page_config(layout="wide")
-st.title("🎯 Derivative Prop Line Calculator")
+st.title("🎯 Advanced Prop Line Calculator")
 
 with st.sidebar:
     st.header("1. Upload Data")
@@ -330,9 +386,7 @@ with st.sidebar:
     * **Column 1:** Prop Line (e.g., 18.5, 19.5)
     * **Column 2:** Book 1 Over Odds
     * **Column 3:** Book 1 Under Odds
-    * **Column 4:** Book 2 Over Odds
-    * **Column 5:** Book 2 Under Odds
-    * *(Repeat for as many books as needed)*
+    * **Column 4:** Book 2 Over Odds...
     """)
     uploaded_file = st.file_uploader("Upload your CSV file", type="csv")
     
@@ -357,12 +411,11 @@ if uploaded_file is not None:
         st.header("Data Preview")
         st.dataframe(df.head())
 
-        if st.button("Run Analysis", use_container_width=True):
-            with st.spinner("Calculating..."):
+        if st.button("Run Advanced Analysis", use_container_width=True):
+            with st.spinner("Calculating Multi-Method Models..."):
                 run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold)
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
-        st.error("This might be due to an unexpected file format or data issue. Please check your CSV file.")
 else:
     st.info("Please upload a CSV file to begin.")
