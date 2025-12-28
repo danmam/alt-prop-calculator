@@ -15,8 +15,11 @@ import matplotlib.cm as cm
 from math import exp, factorial
 
 # ==============================================================================
-# 0. CONFIGURATION
+# 0. CONFIGURATION & SESSION STATE
 # ==============================================================================
+if 'analysis_run' not in st.session_state:
+    st.session_state.analysis_run = False
+
 DEFAULT_MAE_THRESHOLD = 0.05
 DEFAULT_VIG_MARKET_TOTAL = 1.071
 
@@ -321,7 +324,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     
     st.header("Visualizations")
     
-    # --- PLOT 1: Market Consensus (Multiplicative) ---
+    # --- PLOT 1: Market Consensus (Multiplicative Only) ---
     st.subheader("Market Consensus (Multiplicative Models)")
     
     fig_main, ax_main = plt.subplots(figsize=(12, 6))
@@ -330,21 +333,20 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     
     x_range = np.linspace(df['line'].min() - 2, df['line'].max() + 2, 200)
     
+    # A. Plot Curves (Multiplicative ONLY)
     mult_results = [r for r in all_results if r['method'] == 'Multiplicative']
     
     for res in mult_results:
-        # VISIBILITY: Make ALL curves visible to show the spread, distinct by book color
         alpha = 0.8 
         if res['mae'] > mae_threshold:
             ls = ':' 
             alpha = 0.6
         else:
             ls = '-'
-            
         y_vals = [get_prob_from_model(res['params'], x, res['model']) for x in x_range]
         ax_main.plot(x_range, y_vals, color=colors[res['book']], linestyle=ls, alpha=alpha, label=f"{res['book']} ({res['model']})", linewidth=1.5)
 
-    # SCATTER POINTS (Multiplicative Devigged ONLY)
+    # B. Plot Scatter Points (Multiplicative Devigged ONLY)
     for book in books:
         if book not in book_dataframes: continue
         m_df = book_dataframes[book].copy()
@@ -357,12 +359,12 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         # Plot Scatter (matching curve color)
         ax_main.scatter(devig_over['line'], devig_over['fair_prob'], color=colors[book], marker='o', s=30, alpha=0.5)
 
-    # Plot Average Horizontal Line
+    # C. Plot Average Horizontal Line
     if mult_mean_prob:
         ax_main.axhline(y=mult_mean_prob, color='black', linestyle='-', linewidth=2, label=f'Avg Multiplicative Prob ({prob_to_american(mult_mean_prob):+.0f})')
         ax_main.text(df['line'].min(), mult_mean_prob + 0.01, f" Avg: {prob_to_american(mult_mean_prob):+.0f}", fontsize=10, fontweight='bold')
 
-    # Plot Target Line
+    # D. Plot Target Line & Anchor
     ax_main.axvline(x=target_line, color='purple', linestyle=':', linewidth=2, label=f'Target Line {target_line}')
     
     if use_anchor:
@@ -441,9 +443,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
 # 5. STREAMLIT UI
 # ==============================================================================
 
-if 'analysis_run' not in st.session_state:
-    st.session_state.analysis_run = False
-
 st.set_page_config(layout="wide")
 st.title("🎯 Advanced Prop Line Calculator")
 
@@ -472,6 +471,14 @@ with st.sidebar:
     target_line = st.number_input("Target Line", value=18.5, step=1.0, format="%.1f")
     dist_type = st.radio("Distribution Type", ('Discrete', 'Continuous'))
     mae_threshold = st.slider("Max MAE Threshold", 0.01, 0.1, DEFAULT_MAE_THRESHOLD, 0.01)
+    
+    # Checkbox placed PROMINENTLY in Sidebar for visibility
+    st.markdown("---")
+    show_individual = st.checkbox("Show Individual Book Plots (All Methods)", value=False)
+    
+    # Button logic
+    if st.button("Run Analysis", use_container_width=True):
+        st.session_state.analysis_run = True
 
 if uploaded_file is not None:
     try:
@@ -481,13 +488,7 @@ if uploaded_file is not None:
         st.header("Data Preview")
         st.dataframe(df.head())
 
-        # Checkbox MOVED to Main Area (User Input Section)
-        show_individual = st.checkbox("Show Individual Book Plots (All Methods)", value=False)
-        
-        # Button logic with Session State to handle toggling
-        if st.button("Run Analysis", use_container_width=True):
-            st.session_state.analysis_run = True
-            
+        # Execute if button was clicked OR if already run (allows toggling)
         if st.session_state.analysis_run:
             run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold, show_individual)
 
