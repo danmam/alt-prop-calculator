@@ -344,7 +344,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         y_vals = [get_prob_from_model(res['params'], x, res['model']) for x in x_range]
         ax_main.plot(x_range, y_vals, color=colors[res['book']], linestyle=ls, alpha=alpha, label=f"{res['book']} ({res['model']})", linewidth=1.5)
 
-    # ADDED: Scatter Points for Multiplicative Devigged
+    # SCATTER POINTS (Multiplicative Devigged ONLY)
     for book in books:
         if book not in book_dataframes: continue
         m_df = book_dataframes[book].copy()
@@ -355,7 +355,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         devig_over = devig_df[devig_df['type']=='over']
         
         # Plot Scatter (matching curve color)
-        # Note: No separate label to keep legend clean
         ax_main.scatter(devig_over['line'], devig_over['fair_prob'], color=colors[book], marker='o', s=30, alpha=0.5)
 
     # Plot Average Horizontal Line
@@ -442,6 +441,9 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
 # 5. STREAMLIT UI
 # ==============================================================================
 
+if 'analysis_run' not in st.session_state:
+    st.session_state.analysis_run = False
+
 st.set_page_config(layout="wide")
 st.title("🎯 Advanced Prop Line Calculator")
 
@@ -470,9 +472,6 @@ with st.sidebar:
     target_line = st.number_input("Target Line", value=18.5, step=1.0, format="%.1f")
     dist_type = st.radio("Distribution Type", ('Discrete', 'Continuous'))
     mae_threshold = st.slider("Max MAE Threshold", 0.01, 0.1, DEFAULT_MAE_THRESHOLD, 0.01)
-    
-    st.markdown("---")
-    show_individual = st.checkbox("Show Individual Book Plots", value=False)
 
 if uploaded_file is not None:
     try:
@@ -482,7 +481,14 @@ if uploaded_file is not None:
         st.header("Data Preview")
         st.dataframe(df.head())
 
+        # Checkbox MOVED to Main Area (User Input Section)
+        show_individual = st.checkbox("Show Individual Book Plots (All Methods)", value=False)
+        
+        # Button logic with Session State to handle toggling
         if st.button("Run Analysis", use_container_width=True):
+            st.session_state.analysis_run = True
+            
+        if st.session_state.analysis_run:
             run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold, show_individual)
 
     except Exception as e:
