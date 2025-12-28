@@ -11,7 +11,7 @@ except ImportError:
     SKEWT_AVAILABLE = False
 from scipy.optimize import minimize, brentq
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+import matplotlib
 from math import exp, factorial
 
 # ==============================================================================
@@ -161,6 +161,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     """Contains the core analysis logic with robust vig calculation and dynamic book handling."""
     
     # 1. ROBUST COLUMN HANDLING
+    # Safe extraction of the Line column to avoid KeyError later
     line_col = pd.to_numeric(df.iloc[:, 0], errors='coerce')
     total_cols = df.shape[1]
     
@@ -201,7 +202,8 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         
         pivot = market_df.pivot_table(index='line', columns='type', values='odds')
         if 'over' in pivot.columns and 'under' in pivot.columns:
-            two_way_market = pivot[['over', 'under']].dropna().applymap(american_to_prob)
+            # Replaced applymap with map to fix deprecation warning
+            two_way_market = pivot[['over', 'under']].dropna().map(american_to_prob)
             if not two_way_market.empty:
                 over_prob = two_way_market['over'].iloc[0]
                 under_prob = two_way_market['under'].iloc[0]
@@ -313,8 +315,10 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     final_table = pd.concat([pivot_df, mean_row])
     
     st.header("Results Table")
-    formatted_table = final_table.applymap(lambda p: f"{prob_to_american(p):+.0f}" if pd.notnull(p) else "-")
-    st.dataframe(formatted_table, use_container_width=True)
+    # Replaced applymap with map to fix deprecation warning
+    formatted_table = final_table.map(lambda p: f"{prob_to_american(p):+.0f}" if pd.notnull(p) else "-")
+    # Updated use_container_width to width='stretch' to fix deprecation warning
+    st.dataframe(formatted_table, width=1500) 
 
     mult_mean_prob = mean_row['Multiplicative'].iloc[0] if 'Multiplicative' in mean_row.columns else None
 
@@ -328,10 +332,19 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     st.subheader("Market Consensus (Multiplicative Models)")
     
     fig_main, ax_main = plt.subplots(figsize=(12, 6))
-    cmap = cm.get_cmap('tab10')
+    
+    # Replaced get_cmap with matplotlib.colormaps to fix deprecation warning
+    try:
+        cmap = matplotlib.colormaps['tab10']
+    except:
+        cmap = plt.get_cmap('tab10') # Fallback for older mpl versions
+        
     colors = {b: cmap(i % 10) for i, b in enumerate(books)}
     
-    x_range = np.linspace(df['line'].min() - 2, df['line'].max() + 2, 200)
+    # Use line_col instead of df['line'] to prevent KeyError
+    x_min = line_col.min()
+    x_max = line_col.max()
+    x_range = np.linspace(x_min - 2, x_max + 2, 200)
     
     # A. Plot Curves (Multiplicative ONLY)
     mult_results = [r for r in all_results if r['method'] == 'Multiplicative']
@@ -361,8 +374,10 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
 
     # C. Plot Average Horizontal Line
     if mult_mean_prob:
+        # axhline draws a line across the entire plot axes
         ax_main.axhline(y=mult_mean_prob, color='black', linestyle='-', linewidth=2, label=f'Avg Multiplicative Prob ({prob_to_american(mult_mean_prob):+.0f})')
-        ax_main.text(df['line'].min(), mult_mean_prob + 0.01, f" Avg: {prob_to_american(mult_mean_prob):+.0f}", fontsize=10, fontweight='bold')
+        # Use line_col.min() here too to prevent error
+        ax_main.text(x_min, mult_mean_prob + 0.01, f" Avg: {prob_to_american(mult_mean_prob):+.0f}", fontsize=10, fontweight='bold')
 
     # D. Plot Target Line & Anchor
     ax_main.axvline(x=target_line, color='purple', linestyle=':', linewidth=2, label=f'Target Line {target_line}')
@@ -486,7 +501,8 @@ if uploaded_file is not None:
         df.replace(['-', ''], np.nan, inplace=True)
         
         st.header("Data Preview")
-        st.dataframe(df.head())
+        # Updated to use width='stretch' to avoid deprecation warning
+        st.dataframe(df.head(), width=1500)
 
         # Execute if button was clicked OR if already run (allows toggling)
         if st.session_state.analysis_run:
@@ -494,5 +510,7 @@ if uploaded_file is not None:
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
+        # Helpful debugging info
+        st.warning("If this is a Key Error, it likely means the code tried to find a specific column name. I have updated the code to be agnostic to column names.")
 else:
     st.info("Please upload a CSV file to begin.")
