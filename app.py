@@ -19,6 +19,14 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 if 'analysis_run' not in st.session_state:
     st.session_state.analysis_run = False
+if 'results_df' not in st.session_state:
+    st.session_state.results_df = None
+if 'available_books' not in st.session_state:
+    st.session_state.available_books = []
+if 'selected_books' not in st.session_state:
+    st.session_state.selected_books = []
+if 'analysis_params' not in st.session_state:
+    st.session_state.analysis_params = {}
 
 DEFAULT_MAE_THRESHOLD = 0.05
 DEFAULT_VIG_MARKET_TOTAL = 1.071
@@ -247,12 +255,55 @@ def solve_location_shift(params, dist_name, target_line, target_prob):
         return params
 
 # ==============================================================================
+# 2. DISPLAY FUNCTIONS (for dynamic table updates)
+# ==============================================================================
+
+def display_results_table(results_df, selected_books):
+    """Display results table with average calculated from selected books only."""
+    if results_df is None or results_df.empty:
+        return
+    
+    # Filter to only actual model results (not single-line placeholders)
+    res_df_actual = results_df[~results_df.get('is_single_line', False)]
+    
+    if res_df_actual.empty:
+        st.warning("No model results available.")
+        return
+    
+    # Pivot the data
+    pivot_df = res_df_actual.pivot_table(index='book', columns='method', 
+                                         values='target_prob_over', aggfunc='first')
+    
+    # Calculate average from SELECTED books only
+    selected_pivot = pivot_df[pivot_df.index.isin(selected_books)]
+    
+    if not selected_pivot.empty:
+        mean_row = selected_pivot.mean().to_frame().T
+        mean_row.index = [f'AVERAGE ({len(selected_books)} books)']
+    else:
+        mean_row = pd.DataFrame(index=['AVERAGE (0 books)'], columns=pivot_df.columns)
+    
+    # Mark excluded books
+    display_df = pivot_df.copy()
+    display_df.index = [f"{'✓ ' if b in selected_books else '✗ '}{b}" for b in display_df.index]
+    
+    final_table = pd.concat([display_df, mean_row])
+    
+    # Format as American odds
+    formatted_table = final_table.map(lambda p: f"{prob_to_american(p):+.0f}" if pd.notnull(p) else "-")
+    
+    st.dataframe(formatted_table, use_container_width=True)
+    
+    # Return the mean probability for plotting
+    if 'Multiplicative' in mean_row.columns and not selected_pivot.empty:
+        return mean_row['Multiplicative'].iloc[0]
+    return None
+
+# ==============================================================================
 # 4. MAIN ANALYSIS FUNCTION
 # ==============================================================================
 def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold, show_individual_plots):
     """Contains the core analysis logic with robust vig calculation and dynamic book handling."""
-    st.write(f"**Running with distribution type: {dist_type}**")  # DEBUG LINE
-    st.write(f"**Models to test: {['poisson', 'nbinom'] if dist_type == 'Discrete' else ['norm', 'lognorm', 'gamma', 'skewnorm']}**")
     
     # 1. ROBUST COLUMN HANDLING
     line_col = pd.to_numeric(df.iloc[:, 0], errors='coerce')
@@ -285,8 +336,13 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
             continue
             
         loaded_book_signatures.add(book_signature)
+        
+        # Try to get book name from column header
+        col_name = df.columns[i] if i < len(df.columns) else f"Book {book_idx}"
+        book_name = col_name.replace(' over', '').replace(' Over', '').strip()
+        if not book_name or book_name.lower() in ['', 'unnamed']:
+            book_name = f"Book {book_idx}"
             
-        book_name = f"Book {book_idx}"
         books.append(book_name)
         
         temp_df = pd.DataFrame({'line': line_col, 'over': over_raw, 'under': under_raw})
@@ -469,38 +525,43 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
 
     res_df = pd.DataFrame(all_results)
     
-    # Filter out single-line pseudo results from the main table
-    res_df_actual = res_df[~res_df['is_single_line']]
+    # Store results in session state for dynamic updates
+    st.session_state.results_df = res_df
+    st.session_state.available_books = [b for b in books if b not in single_line_books]
+    st.session_state.selected_books = st.session_state.available_books.copy()  # All selected by default
+    st.session_state.analysis_params = {
+        'book_dataframes': book_dataframes,
+        'book_vigs': book_vigs,
+        'book_alt_line_counts': book_alt_line_counts,
+        'fair_anchor_line': fair_anchor_line,
+        'fair_anchor_prob': fair_anchor_prob,
+        'target_line': target_line,
+        'line_col': line_col,
+        'mae_threshold': mae_threshold,
+        'single_line_books': single_line_books
+    }
     
-    if res_df_actual.empty:
-        st.error("No models could be fit to the data.")
-        return
-    
-    # ==========================================================================
-    # 3. RESULTS TABLE WITH AVERAGES
-    # ==========================================================================
-    
-    pivot_df = res_df_actual.pivot_table(index='book', columns='method', 
-                                         values='target_prob_over', aggfunc='first')
-    
-    mean_row = pivot_df.mean().to_frame().T
-    mean_row.index = ['AVERAGE']
-    
-    final_table = pd.concat([pivot_df, mean_row])
-    
-    st.header("Results Table")
-    formatted_table = final_table.map(lambda p: f"{prob_to_american(p):+.0f}" if pd.notnull(p) else "-")
-    st.dataframe(formatted_table, width=1500) 
+    # Display will be handled by the main UI section
 
-    mult_mean_prob = mean_row['Multiplicative'].iloc[0] if 'Multiplicative' in mean_row.columns else None
 
-    # ==========================================================================
-    # 4. PLOTTING - DEFAULT (Multiplicative Consensus)
-    # ==========================================================================
+# ==============================================================================
+# 5. PLOTTING FUNCTION
+# ==============================================================================
+
+def create_main_plot(results_df, selected_books, params):
+    """Create the main visualization plot."""
+    if results_df is None or params is None:
+        return None
     
-    st.header("Visualizations")
+    book_dataframes = params['book_dataframes']
+    book_vigs = params['book_vigs']
+    fair_anchor_line = params['fair_anchor_line']
+    fair_anchor_prob = params['fair_anchor_prob']
+    target_line = params['target_line']
+    line_col = params['line_col']
+    mae_threshold = params['mae_threshold']
     
-    st.subheader("Market Consensus (Multiplicative Models)")
+    books = list(book_dataframes.keys())
     
     fig_main, ax_main = plt.subplots(figsize=(12, 6))
     
@@ -515,10 +576,14 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     x_max = line_col.max()
     x_range = np.linspace(x_min - 2, x_max + 2, 200)
     
-    # A. Plot Curves (Multiplicative ONLY, exclude single-line books)
-    mult_results = [r for r in all_results if r['method'] == 'Multiplicative' and not r['is_single_line']]
+    # Filter results
+    res_df_actual = results_df[~results_df.get('is_single_line', False)]
+    mult_results = res_df_actual[res_df_actual['method'] == 'Multiplicative'].to_dict('records')
     
+    # A. Plot Curves
     for res in mult_results:
+        if res['book'] not in selected_books:
+            continue
         alpha = 0.8 
         if res['mae'] > mae_threshold:
             ls = ':' 
@@ -529,7 +594,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         ax_main.plot(x_range, y_vals, color=colors[res['book']], linestyle=ls, 
                     alpha=alpha, label=f"{res['book']} ({res['model']})", linewidth=1.5)
 
-    # B. Plot Scatter Points (All books, including single-line)
+    # B. Plot Scatter Points
     for book in books:
         if book not in book_dataframes: continue
         m_df = book_dataframes[book].copy()
@@ -538,16 +603,17 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
         devig_df = devig_market_data(m_df, vig, method='multiplicative')
         devig_over = devig_df[devig_df['type']=='over']
         
-        # Different marker for single-line books
-        if book in single_line_books:
-            ax_main.scatter(devig_over['line'], devig_over['fair_prob'], 
-                          color=colors[book], marker='x', s=80, alpha=0.7, linewidths=2)
-        else:
-            ax_main.scatter(devig_over['line'], devig_over['fair_prob'], 
-                          color=colors[book], marker='o', s=30, alpha=0.5)
+        marker_alpha = 0.5 if book in selected_books else 0.15
+        ax_main.scatter(devig_over['line'], devig_over['fair_prob'], 
+                      color=colors[book], marker='o', s=30, alpha=marker_alpha)
 
-    # C. Plot Average Horizontal Line
-    if mult_mean_prob:
+    # C. Plot Average Horizontal Line (only from selected books)
+    selected_results = res_df_actual[
+        (res_df_actual['method'] == 'Multiplicative') & 
+        (res_df_actual['book'].isin(selected_books))
+    ]
+    if not selected_results.empty:
+        mult_mean_prob = selected_results['target_prob_over'].mean()
         ax_main.axhline(y=mult_mean_prob, color='black', linestyle='-', linewidth=2, 
                        label=f'Avg Multiplicative ({prob_to_american(mult_mean_prob):+.0f})')
         ax_main.text(x_min, mult_mean_prob + 0.01, 
@@ -581,73 +647,15 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_typ
     ax_main.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.08, 1), loc='upper left')
     ax_main.grid(True, alpha=0.3)
     
-    st.pyplot(fig_main)
-
-    # ==========================================================================
-    # 5. PLOTTING - INDIVIDUAL DETAILS (Optional)
-    # ==========================================================================
-    
-    if show_individual_plots:
-        st.markdown("---")
-        st.subheader("Individual Book Details")
-        
-        for book in books:
-            if book in single_line_books:
-                st.info(f"**{book}**: Only 1 alt line available - no model fitted")
-                continue
-                
-            book_results = [r for r in all_results if r['book'] == book and not r['is_single_line']]
-            if not book_results: continue
-            
-            fig_sub, ax_sub = plt.subplots(figsize=(10, 5))
-            
-            m_df = book_dataframes[book].copy()
-            vig = book_vigs.get(book, DEFAULT_VIG_MARKET_TOTAL)
-            
-            # Raw
-            m_df['raw_prob'] = m_df['odds'].apply(american_to_prob)
-            raw_over = m_df[m_df['type']=='over']
-            ax_sub.scatter(raw_over['line'], raw_over['raw_prob'], color='gray', 
-                          marker='x', s=50, alpha=0.6, label='Raw Odds (With Vig)')
-            
-            # Devigged
-            devig_df = devig_market_data(m_df.copy(), vig, method='multiplicative')
-            devig_over = devig_df[devig_df['type']=='over']
-            ax_sub.scatter(devig_over['line'], devig_over['fair_prob'], color='black', 
-                          marker='o', s=50, alpha=0.8, label='Fair Odds (No Vig)')
-            
-            # Plot Curves
-            styles = {'Additive': ':', 'Multiplicative': '--', 'Shape Retention': '-'}
-            
-            for res in book_results:
-                y_vals = [get_prob_from_model(res['params'], x, res['model']) for x in x_range]
-                ls = styles.get(res['method'], '-')
-                ax_sub.plot(x_range, y_vals, linestyle=ls, linewidth=2, 
-                           label=f"{res['method']} ({res['model']})")
-                
-            ax_sub.set_title(f"{book} Analysis ({book_alt_line_counts[book]} alt lines)")
-            ax_sub.set_ylabel("Fair Odds")
-            ax_sub.set_ylim(0.02, 0.98)
-            ax_sub.set_yticks(ticks)
-            ax_sub.set_yticklabels([f'{prob_to_american(t):+.0f}' for t in ticks])
-            ax_sub.axvline(x=target_line, color='purple', linestyle=':', alpha=0.5)
-            
-            if fair_anchor_line is not None:
-                ax_sub.scatter(fair_anchor_line, fair_anchor_prob, c='red', s=100, 
-                             marker='*', label='Anchor Point', zorder=10)
-            
-            ax_sub.legend()
-            ax_sub.grid(True, alpha=0.3)
-            
-            st.pyplot(fig_sub)
+    return fig_main
 
 
 # ==============================================================================
-# 5. STREAMLIT UI
+# 6. STREAMLIT UI
 # ==============================================================================
 
 st.set_page_config(layout="wide")
-st.title("🎯 Advanced Prop Line Calculator v2.1 (Optimized)")
+st.title("🎯 Advanced Prop Line Calculator v2.2")
 
 # Performance note
 with st.expander("⚡ Performance Optimizations"):
@@ -661,7 +669,8 @@ with st.expander("⚡ Performance Optimizations"):
     - 🎯 Limited optimization iterations to 100 (was unlimited)
     - 📊 Smarter progress tracking
     
-    **Result: ~60-70% faster** while maintaining accuracy
+    **New in v2.2:**
+    - 📊 **Dynamic book selection** - exclude books from average calculation
     """)
 
 with st.sidebar:
@@ -697,6 +706,10 @@ with st.sidebar:
     
     if st.button("Run Analysis", use_container_width=True):
         st.session_state.analysis_run = True
+        # Clear previous results when re-running
+        st.session_state.results_df = None
+        st.session_state.available_books = []
+        st.session_state.selected_books = []
 
 if uploaded_file is not None:
     try:
@@ -707,8 +720,111 @@ if uploaded_file is not None:
         st.dataframe(df.head(), width=1500)
 
         if st.session_state.analysis_run:
-            run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, 
-                        dist_type, mae_threshold, show_individual)
+            # Run analysis if needed (stores results in session state)
+            if st.session_state.results_df is None:
+                run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, 
+                            dist_type, mae_threshold, show_individual)
+            
+            # Display results if available
+            if st.session_state.results_df is not None and len(st.session_state.available_books) > 0:
+                st.header("Results")
+                
+                # Book selection widget
+                st.subheader("📊 Select Books for Average")
+                selected = st.multiselect(
+                    "Choose which books to include in the average calculation:",
+                    options=st.session_state.available_books,
+                    default=st.session_state.selected_books,
+                    key="book_selector"
+                )
+                st.session_state.selected_books = selected
+                
+                if not selected:
+                    st.warning("⚠️ No books selected. Please select at least one book.")
+                
+                # Results table (updates dynamically based on selection)
+                st.subheader("Fair Value Results")
+                display_results_table(st.session_state.results_df, selected)
+                
+                # Visualizations
+                st.header("Visualizations")
+                st.subheader("Market Consensus (Multiplicative Models)")
+                
+                fig = create_main_plot(
+                    st.session_state.results_df, 
+                    selected,
+                    st.session_state.analysis_params
+                )
+                if fig:
+                    st.pyplot(fig)
+                
+                # Individual book plots (optional)
+                if show_individual and st.session_state.analysis_params:
+                    params = st.session_state.analysis_params
+                    st.markdown("---")
+                    st.subheader("Individual Book Details")
+                    
+                    book_dataframes = params['book_dataframes']
+                    book_vigs = params['book_vigs']
+                    book_alt_line_counts = params['book_alt_line_counts']
+                    single_line_books = params['single_line_books']
+                    
+                    line_col = params['line_col']
+                    x_min = line_col.min()
+                    x_max = line_col.max()
+                    x_range = np.linspace(x_min - 2, x_max + 2, 200)
+                    ticks = np.arange(0.1, 1.0, 0.1)
+                    
+                    for book in book_dataframes.keys():
+                        if book in single_line_books:
+                            st.info(f"**{book}**: Only 1 alt line available - no model fitted")
+                            continue
+                        
+                        res_df_actual = st.session_state.results_df[~st.session_state.results_df.get('is_single_line', False)]
+                        book_results = res_df_actual[res_df_actual['book'] == book].to_dict('records')
+                        if not book_results: continue
+                        
+                        fig_sub, ax_sub = plt.subplots(figsize=(10, 5))
+                        
+                        m_df = book_dataframes[book].copy()
+                        vig = book_vigs.get(book, DEFAULT_VIG_MARKET_TOTAL)
+                        
+                        # Raw
+                        m_df['raw_prob'] = m_df['odds'].apply(american_to_prob)
+                        raw_over = m_df[m_df['type']=='over']
+                        ax_sub.scatter(raw_over['line'], raw_over['raw_prob'], color='gray', 
+                                      marker='x', s=50, alpha=0.6, label='Raw Odds (With Vig)')
+                        
+                        # Devigged
+                        devig_df = devig_market_data(m_df.copy(), vig, method='multiplicative')
+                        devig_over = devig_df[devig_df['type']=='over']
+                        ax_sub.scatter(devig_over['line'], devig_over['fair_prob'], color='black', 
+                                      marker='o', s=50, alpha=0.8, label='Fair Odds (No Vig)')
+                        
+                        # Plot Curves
+                        styles = {'Additive': ':', 'Multiplicative': '--', 'Shape Retention': '-'}
+                        
+                        for res in book_results:
+                            y_vals = [get_prob_from_model(res['params'], x, res['model']) for x in x_range]
+                            ls = styles.get(res['method'], '-')
+                            ax_sub.plot(x_range, y_vals, linestyle=ls, linewidth=2, 
+                                       label=f"{res['method']} ({res['model']})")
+                            
+                        ax_sub.set_title(f"{book} Analysis ({book_alt_line_counts[book]} alt lines)")
+                        ax_sub.set_ylabel("Fair Odds")
+                        ax_sub.set_ylim(0.02, 0.98)
+                        ax_sub.set_yticks(ticks)
+                        ax_sub.set_yticklabels([f'{prob_to_american(t):+.0f}' for t in ticks])
+                        ax_sub.axvline(x=params['target_line'], color='purple', linestyle=':', alpha=0.5)
+                        
+                        if params['fair_anchor_line'] is not None:
+                            ax_sub.scatter(params['fair_anchor_line'], params['fair_anchor_prob'], 
+                                         c='red', s=100, marker='*', label='Anchor Point', zorder=10)
+                        
+                        ax_sub.legend()
+                        ax_sub.grid(True, alpha=0.3)
+                        
+                        st.pyplot(fig_sub)
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
