@@ -251,6 +251,8 @@ def solve_location_shift(params, dist_name, target_line, target_prob):
 # ==============================================================================
 def run_analysis(df, use_anchor, anchor_line, anchor_odds, target_line, dist_type, mae_threshold, show_individual_plots):
     """Contains the core analysis logic with robust vig calculation and dynamic book handling."""
+    st.write(f"**Running with distribution type: {dist_type}**")  # DEBUG LINE
+    st.write(f"**Models to test: {['poisson', 'nbinom'] if dist_type == 'Discrete' else ['norm', 'lognorm', 'gamma', 'skewnorm']}**")
     
     # 1. ROBUST COLUMN HANDLING
     line_col = pd.to_numeric(df.iloc[:, 0], errors='coerce')
