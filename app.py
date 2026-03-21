@@ -156,9 +156,12 @@ def calculate_consensus_fair_value(book_dataframes):
         consensus_line = sum(all_lines) / len(all_lines)
         return consensus_line, 0.50, contributions
 
-    # Fallback B: all on one side of 50% — use closest point with its actual fair_prob
-    best_idx = min(range(len(probs)), key=lambda i: abs(probs[i] - 0.50))
-    return lines[best_idx], probs[best_idx], contributions
+    # Fallback B: all on one side of 50% — average all lines tied at min distance to 50%
+    min_dist  = min(abs(p - 0.50) for p in probs)
+    tied_idxs = [i for i in range(len(probs)) if abs(abs(probs[i] - 0.50) - min_dist) < 1e-9]
+    consensus_line = sum(lines[i] for i in tied_idxs) / len(tied_idxs)
+    consensus_prob = sum(probs[i] for i in tied_idxs) / len(tied_idxs)
+    return consensus_line, consensus_prob, contributions
 
 
 def get_prob_from_model(params, line, dist_name):
@@ -226,9 +229,36 @@ def fit_model(market_df, dist_name, target_col='fair_prob'):
 
 def solve_location_shift(params, dist_name, target_line, target_prob):
     """
-    Shifts the location parameter so that P(X > target_line) = target_prob.
+    Shifts the location (or rate) parameter so that P(X > target_line) = target_prob.
     Shape and scale are preserved.
+
+    For continuous distributions: solves for the location parameter.
+    For discrete distributions (poisson, nbinom): solves for the rate/probability
+    parameter directly, since they have no location parameter.
     """
+    # ── Discrete distributions — solve for rate parameter ─────────────────────
+    if dist_name == 'poisson':
+        k_floor = int(np.floor(target_line))
+        def obj_pois(mu):
+            return (1.0 - poisson.cdf(k_floor, mu=mu)) - target_prob
+        try:
+            new_mu = brentq(obj_pois, 0.01, 500)
+            return [new_mu]
+        except Exception:
+            return params
+
+    if dist_name == 'nbinom':
+        k_floor = int(np.floor(target_line))
+        n = params[0]
+        def obj_nb(p_val):
+            return (1.0 - nbinom.cdf(k_floor, n=n, p=p_val)) - target_prob
+        try:
+            new_p = brentq(obj_nb, 0.001, 0.999)
+            return [n, new_p]
+        except Exception:
+            return params
+
+    # ── Continuous distributions — solve for location parameter ───────────────
     def make_params(loc_val):
         p = list(params)
         if   dist_name == 'norm':     p[0] = loc_val
