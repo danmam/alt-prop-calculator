@@ -105,8 +105,11 @@ def calculate_consensus_fair_value(book_dataframes):
       2. Group by unique line; compute simple average fair_prob per unique line.
       3. Find the 50% crossing via linear interpolation between adjacent unique-line points.
       4. Fallback A — all points exactly 50%: equal-weighted average of all book lines.
-      5. Fallback B — no crossing but not all 50%: use the point closest to 50%
-         (keeps actual fair_prob rather than forcing 50%).
+      5. Fallback B — no strict crossing (e.g. one unique line sits exactly at 50%):
+         book-count × probability weighted blend across all unique lines.
+         weight_i = n_i * p_i  (more books + higher fair prob → more pull)
+         consensus_line = Σ(weight_i * L_i) / Σ(weight_i)
+         consensus_prob = Σ(n_i * p_i) / Σ(n_i)
 
     Returns: (consensus_line, consensus_prob, contributions_list)
     """
@@ -156,11 +159,12 @@ def calculate_consensus_fair_value(book_dataframes):
         consensus_line = sum(all_lines) / len(all_lines)
         return consensus_line, 0.50, contributions
 
-    # Fallback B: all on one side of 50% — average all lines tied at min distance to 50%
-    min_dist  = min(abs(p - 0.50) for p in probs)
-    tied_idxs = [i for i in range(len(probs)) if abs(abs(probs[i] - 0.50) - min_dist) < 1e-9]
-    consensus_line = sum(lines[i] for i in tied_idxs) / len(tied_idxs)
-    consensus_prob = sum(probs[i] for i in tied_idxs) / len(tied_idxs)
+    # Fallback B: no strict 50% crossing — book-count × probability weighted blend
+    counts = [len(by_line[line]) for line in lines]
+    weights = [counts[i] * probs[i] for i in range(len(lines))]
+    total_weight = sum(weights)
+    consensus_line = sum(weights[i] * lines[i] for i in range(len(lines))) / total_weight
+    consensus_prob = sum(counts[i] * probs[i] for i in range(len(lines))) / sum(counts)
     return consensus_line, consensus_prob, contributions
 
 
