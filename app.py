@@ -506,14 +506,26 @@ def solve_location_shift(params, dist_name, target_line, target_prob):
     def objective(loc_val):
         return get_prob_from_model(make_params(loc_val), target_line, dist_name) - target_prob
 
-    try:
-        current_loc = (params[0] if dist_name == 'norm'
-                       else params[2] if dist_name == 'skewt'
-                       else params[1])
-        new_loc = brentq(objective, current_loc - 30, current_loc + 30)
-        return make_params(new_loc)
-    except Exception:
-        return params
+    # P(X > target_line) is monotonic in the location parameter, so widen the
+    # search window around the current location until the root is bracketed.
+    # (A fixed ±30 window silently failed when relocating a borrowed donor shape
+    # whose centre was far from the target line.)
+    current_loc = (params[0] if dist_name == 'norm'
+                   else params[2] if dist_name == 'skewt'
+                   else params[1])
+    for half in (30, 60, 120, 250, 500, 1000):
+        lo, hi = current_loc - half, current_loc + half
+        try:
+            f_lo, f_hi = objective(lo), objective(hi)
+        except Exception:
+            continue
+        if np.isnan(f_lo) or np.isnan(f_hi) or f_lo * f_hi > 0:
+            continue
+        try:
+            return make_params(brentq(objective, lo, hi))
+        except Exception:
+            break
+    return params
 
 
 # ==============================================================================
