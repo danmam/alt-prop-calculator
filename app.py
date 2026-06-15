@@ -207,11 +207,13 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
 
     Continuous models anchor at the (fractional) consensus median.
 
-    Discrete models (`discrete=True`) snap the consensus line to the nearest X.5
-    line and report the consensus probability AT that line — generally NOT 50% —
-    by evaluating each two-way book's (own or relocated) fitted CDF at the snapped
-    line, then confidence-weighted averaging. This keeps the anchor on a real
-    half-integer line where floor(line) is unambiguous for discrete CDFs.
+    Discrete models (`discrete=True`) anchor on a REAL posted two-way line rather
+    than an invented value: the nearest posted two-way line to the consensus
+    centre, preferring half (X.5) lines and only using whole-number two-way lines
+    if no half-line two-way market exists. Whole-number lines carry a push, so a
+    book balanced at a whole number N is relocated to be symmetric about N (so
+    Over N-0.5 == Under N+0.5) via relocate_to_two_way(). The anchor probability
+    is the confidence-weighted P(X > anchor_line) across the two-way books.
 
     A logit-linear slope (estimate_book_fair_line) is retained only as a fallback
     when no distribution fit is available.
@@ -300,7 +302,7 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
             dist, params, src = own_fit['dist_name'], own_fit['params'], 'own fit'
         elif donor is not None:
             dist = donor['dist']
-            params = solve_location_shift(donor['params'], dist, line, fair_prob)
+            params = relocate_to_two_way(donor['params'], dist, line, fair_prob, discrete)
             src = f"borrowed {donor['book']}"
 
         median = model_median(params, dist, search_bounds, prob_target) \
@@ -353,12 +355,36 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
     if not discrete:
         return consensus_line, prob_target, contributions
 
-    # Discrete: snap to the nearest X.5 line; report the consensus probability
-    # there, read from each two-way book's actual fitted CDF.
-    snapped_line = float(np.floor(consensus_line) + 0.5)
+    # Discrete: anchor on a REAL posted two-way line rather than an invented X.5.
+    # Whole-number lines carry a push, so a half (X.5) line is unambiguous and
+    # preferred; only fall back to whole-number two-way lines if no half-line
+    # two-way market exists anywhere.
+    two_way_lines = set()
+    for book_name, info in per_book.items():
+        if info['balanced'] is None:
+            continue
+        piv = book_dataframes[book_name].pivot_table(
+            index='line', columns='type', values='odds')
+        if 'over' in piv.columns and 'under' in piv.columns:
+            for L, row in piv.iterrows():
+                if pd.notna(row.get('over')) and pd.notna(row.get('under')):
+                    two_way_lines.add(float(L))
+
+    half_lines  = sorted(L for L in two_way_lines if abs(L - round(L)) > 1e-9)
+    whole_lines = sorted(L for L in two_way_lines if abs(L - round(L)) <= 1e-9)
+    candidates  = half_lines if half_lines else whole_lines
+
+    if candidates:
+        # Nearest posted two-way line to the consensus centre.
+        anchor_line = min(candidates, key=lambda L: abs(L - consensus_line))
+    else:
+        anchor_line = float(np.floor(consensus_line) + 0.5)
+
+    # Anchor probability = confidence-weighted P(X > anchor_line) across the
+    # two-way books, read from each book's (push-aware) fitted CDF.
     num = den = 0.0
     for w in weighted:
-        p_at = (get_prob_from_model(w['params'], snapped_line, w['dist'])
+        p_at = (get_prob_from_model(w['params'], anchor_line, w['dist'])
                 if w['params'] is not None else None)
         if p_at is None or not (0.0 <= p_at <= 1.0) or np.isnan(p_at):
             p_at = prob_target   # degenerate — fall back to the target
@@ -366,7 +392,7 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
         num += p_at * w['weight']
         den += w['weight']
     consensus_prob = num / den if den > 0 else prob_target
-    return snapped_line, consensus_prob, contributions
+    return float(anchor_line), consensus_prob, contributions
 
 
 def get_prob_from_model(params, line, dist_name):
@@ -526,6 +552,40 @@ def solve_location_shift(params, dist_name, target_line, target_prob):
         except Exception:
             break
     return params
+
+
+def relocate_to_two_way(params, dist_name, line, fair_over_prob, discrete):
+    """
+    Relocate a distribution to match a posted two-way market at `line`.
+
+    Half (X.5) lines have no push, so this is just P(X > line) = fair_over_prob
+    (delegated to solve_location_shift).
+
+    Whole-number lines N carry a push at X = N: the two-way market prices
+    Over N (X ≥ N+1) vs Under N (X ≤ N-1) and refunds X = N. The fair over price
+    is therefore P(X≥N+1) / (P(X≥N+1) + P(X≤N-1)), NOT P(X≥N+1) alone. Matching
+    that ratio keeps a balanced book symmetric about N (median ≈ N) instead of
+    being pushed off the whole number. Only meaningful for discrete families.
+    """
+    is_whole = abs(line - round(line)) < 1e-9
+    if discrete and is_whole and dist_name in ('poisson', 'nbinom'):
+        N = int(round(line))
+
+        def ratio_resid(test_params):
+            a = get_prob_from_model(test_params, N, dist_name)            # P(X ≥ N+1)
+            b = 1.0 - get_prob_from_model(test_params, N - 1, dist_name)  # P(X ≤ N-1)
+            tot = a + b
+            return (a / tot if tot > 0 else 0.0) - fair_over_prob
+
+        try:
+            if dist_name == 'poisson':
+                return [brentq(lambda mu: ratio_resid([mu]), 0.01, 500)]
+            n = params[0]   # nbinom: preserve shape n, solve success prob p
+            return [n, brentq(lambda p: ratio_resid([n, p]), 1e-4, 1 - 1e-4)]
+        except Exception:
+            return params
+
+    return solve_location_shift(params, dist_name, line, fair_over_prob)
 
 
 # ==============================================================================
@@ -742,9 +802,10 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
                     "fit; a single-line two-way book borrows the best multi-line fit "
                     "(`role = shape donor`), relocated to its posted point. The consensus "
                     "is the confidence-weighted average of those medians (weight = lines × "
-                    "balance). For **Discrete** models the consensus line is snapped to "
-                    "the nearest X.5 line and the anchor probability (`prob_at_anchor`) is "
-                    "read from each book's fitted CDF at that line — generally not 50%."
+                    "balance). For **Discrete** models the anchor is placed on the nearest "
+                    "**posted two-way line** (preferring X.5 lines; whole-number lines are "
+                    "treated as a push and kept symmetric), and the anchor probability "
+                    "(`prob_at_anchor`) is the consensus P(X > line) there — generally not 50%."
                 )
                 contrib_df = pd.DataFrame(contributions)
                 st.dataframe(contrib_df)
@@ -967,11 +1028,13 @@ with st.expander("ℹ️ v2.4 — Distribution-Based Consensus Anchor"):
       of those medians (weight = lines × balance). This is materially more accurate
       than a linear slope when projecting offset two-way lines over many points,
       because real stat distributions are skewed.
-    - **Discrete models snap to an X.5 line.** When *Distribution Type* is
-      **Discrete**, the consensus line is snapped to the nearest half-integer line
-      (0.5, 1.5, 2.5, …) and the anchor probability is read from each book's fitted
-      CDF *at that line* (generally not 50%), so the anchor sits where `floor(line)`
-      is unambiguous for discrete CDFs rather than being treated continuously.
+    - **Discrete models anchor on a real posted two-way line.** When *Distribution
+      Type* is **Discrete**, the anchor is the nearest posted two-way line to the
+      consensus centre — preferring half (X.5) lines and only using whole-number
+      two-way lines when no X.5 two-way market exists, so the anchor is never an
+      invented value. Whole-number lines carry a push at X = N, so a book balanced
+      there is kept symmetric about N (Over N−0.5 == Under N+0.5). The anchor
+      probability is the consensus P(X > line) at that line (generally not 50%).
 
     **Carried over from v2.3 — Power-method devigging:**
     - Exponent *k* is solved from the most balanced two-sided market at each book
