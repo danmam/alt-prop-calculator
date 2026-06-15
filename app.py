@@ -96,76 +96,245 @@ def find_most_balanced_two_way_market(market_df):
             market_total, best['fair_over_prob'], best['k'])
 
 
-def calculate_consensus_fair_value(book_dataframes):
-    """
-    Equal-weight interpolation-based consensus anchor.
+def _logit(p, eps=1e-6):
+    """Log-odds of a probability, clamped away from 0/1 for numerical safety."""
+    p = min(max(float(p), eps), 1.0 - eps)
+    return np.log(p / (1.0 - p))
 
-    Algorithm:
-      1. For each book with a two-sided line: record (line, power-devigged fair_prob).
-      2. Group by unique line; compute simple average fair_prob per unique line.
-      3. Find the 50% crossing via linear interpolation between adjacent unique-line points.
-      4. Fallback A — all points exactly 50%: equal-weighted average of all book lines.
-      5. Fallback B — no strict crossing (e.g. one unique line sits exactly at 50%):
-         book-count × probability weighted blend across all unique lines.
-         weight_i = n_i * p_i  (more books + higher fair prob → more pull)
-         consensus_line = Σ(weight_i * L_i) / Σ(weight_i)
-         consensus_prob = Σ(n_i * p_i) / Σ(n_i)
+
+def estimate_book_fair_line(points, prob_target=0.50):
+    """
+    Estimate the line at which a single book prices `prob_target`, using its
+    FULL power-devigged alt-line ladder rather than a single point.
+
+    `points` is a list of (line, fair_prob) tuples for the over side.
+
+    Rationale: for a wide class of underlying distributions, logit(P(X > line))
+    is approximately linear in `line` through the central region. A weighted
+    least-squares fit of logit(p) on line therefore gives a robust estimate of
+    the median/mainline (where logit = 0) that uses the whole spread of the
+    ladder, and degrades gracefully to interpolation when only a couple of lines
+    are present. Points are weighted by p*(1-p) (Bernoulli variance, peaking at
+    0.5), which trusts lines near the median and discounts noisy tails.
+
+    Returns a dict describing the estimate (line50, slope, n, brackets, r2, ...).
+    """
+    # Collapse duplicate lines (average fair prob per unique line).
+    by_line = defaultdict(list)
+    for L, p in points:
+        if pd.notna(L) and pd.notna(p):
+            by_line[float(L)].append(float(p))
+    uniq = sorted((L, sum(ps) / len(ps)) for L, ps in by_line.items())
+    if not uniq:
+        return None
+
+    Ls = np.array([u[0] for u in uniq], dtype=float)
+    ps = np.array([u[1] for u in uniq], dtype=float)
+    n  = len(uniq)
+
+    info = {
+        'n': n,
+        'line_min': float(Ls.min()),
+        'line_max': float(Ls.max()),
+        'brackets': bool(ps.max() >= prob_target >= ps.min()),
+        'slope': None, 'line50': None, 'r2': None,
+        'point': (float(Ls[0]), float(ps[0])) if n == 1 else None,
+    }
+    target_logit = _logit(prob_target)
+
+    # Single line: can only self-anchor if it already sits at the target.
+    if n < 2:
+        info['line50'] = float(Ls[0]) if abs(ps[0] - prob_target) < 1e-6 else None
+        return info
+
+    # Weighted log-odds regression: logit(p) = a + b * line.
+    y = np.array([_logit(p) for p in ps])
+    w = np.clip(ps * (1.0 - ps), 1e-6, None)
+
+    W    = w.sum()
+    xbar = (w * Ls).sum() / W
+    ybar = (w * y).sum() / W
+    sxx  = (w * (Ls - xbar) ** 2).sum()
+    sxy  = (w * (Ls - xbar) * (y - ybar)).sum()
+    if sxx < 1e-12:
+        return info
+
+    b = sxy / sxx
+    a = ybar - b * xbar
+    info['slope'] = float(b)
+
+    y_hat  = a + b * Ls
+    ss_res = (w * (y - y_hat) ** 2).sum()
+    ss_tot = (w * (y - ybar) ** 2).sum()
+    info['r2'] = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else None
+
+    if b < -1e-9:                       # well-behaved: prob decreases with line
+        info['line50'] = float((target_logit - a) / b)
+    else:                               # anomalous slope — fall back to nearest line
+        info['line50'] = float(Ls[int(np.argmin(np.abs(ps - prob_target)))])
+    return info
+
+
+def calculate_consensus_fair_value(book_dataframes, book_ks=None,
+                                   fallback_k=None, prob_target=0.50,
+                                   discrete=False):
+    """
+    Dispersion-borrowing consensus anchor.
+
+    Two distinct kinds of information are separated and recombined:
+
+      * LOCATION (mean) — only books that post a genuine two-sided market
+        contribute to where the consensus line sits. Their power-devig is
+        reliable (both sides present), so their fair probability at the posted
+        line is trustworthy.
+
+      * DISPERSION (variance/shape) — every book with multiple alt lines,
+        INCLUDING over-only ladders, contributes its slope d·logit(P(X>line))/d·line.
+        That slope encodes how quickly fair probability changes per unit of line,
+        i.e. the implied spread of the stat. A one-sided ladder's absolute level
+        may be biased by the approximate devig, but its *slope* is robust — so we
+        borrow only the slope from those deep ladders.
+
+    The borrowed dispersion is then used to project each two-way book's posted
+    point (line, fair_prob) to the line where it would price `prob_target`:
+
+        L_target = line + (logit(prob_target) - logit(fair_prob)) / slope
+
+    A two-way book uses its OWN slope if its ladder has ≥2 lines; otherwise it
+    borrows the line-count-weighted global slope pooled across all multi-line
+    books. The consensus is the balance-weighted average of these projected
+    lines across two-way books only.
+
+    Continuous models anchor at the (fractional) consensus 50% line.
+
+    Discrete models (`discrete=True`) instead snap the consensus line to the
+    nearest X.5 line and report the consensus probability AT that line — which is
+    generally NOT 50%. Each two-way book's probability at the snapped line is
+    computed from its own projected fair line + slope, then balance-weighted
+    averaged. This keeps the anchor on a real half-integer line where floor(line)
+    is unambiguous for discrete CDFs.
+
+    `book_ks` / `fallback_k` come from run_analysis (the same k used elsewhere).
 
     Returns: (consensus_line, consensus_prob, contributions_list)
     """
-    book_points  = []
-    contributions = []
+    book_ks      = book_ks or {}
+    target_logit = _logit(prob_target)
 
+    # ── 1. Per-book devigged over ladder, slope estimate, and two-way point ────
+    per_book = {}
     for book_name, market_df in book_dataframes.items():
-        result = find_most_balanced_two_way_market(market_df)
-        if result is None:
+        k = book_ks.get(book_name, fallback_k)
+        if k is None:
+            res0 = find_most_balanced_two_way_market(market_df)
+            k = res0[5] if res0 else 1.0
+
+        over_df = market_df[market_df['type'] == 'over']
+        pts = [(row['line'], american_to_prob(row['odds']) ** k)
+               for _, row in over_df.iterrows() if pd.notna(row['odds'])]
+        est = estimate_book_fair_line(pts, prob_target) if pts else None
+
+        balanced = find_most_balanced_two_way_market(market_df)  # None if one-sided
+        per_book[book_name] = {'k': k, 'est': est, 'balanced': balanced}
+
+    # ── 2. Pool DISPERSION from every multi-line book (slope of logit vs line) ──
+    slope_donors = []
+    for book_name, info in per_book.items():
+        e = info['est']
+        if e and e['slope'] is not None and e['slope'] < 0 and e['n'] >= 2:
+            conf = e['n'] * (max(e['r2'], 0.1) if e['r2'] is not None else 1.0)
+            slope_donors.append((e['slope'], conf))
+    global_slope = (sum(s * c for s, c in slope_donors) / sum(c for _, c in slope_donors)
+                    if slope_donors else None)
+
+    # ── 3. LOCATION from two-way books only, projected with borrowed dispersion ─
+    contributions  = []
+    weighted_lines = []
+    for book_name, info in per_book.items():
+        balanced = info['balanced']
+        e        = info['est']
+
+        if balanced is None:
+            # Over-only book: dispersion donor only — never moves the mean.
+            if e and e['slope'] is not None:
+                contributions.append({
+                    'book': book_name, 'role': 'dispersion only',
+                    'lines_used': e['n'], 'posted_line': None,
+                    'fair_prob': None, 'fair_line_50%': None,
+                    'slope': round(e['slope'], 4),
+                    'r2': round(e['r2'], 3) if e['r2'] is not None else None,
+                    'k': round(info['k'], 4) if info['k'] else None,
+                    'weight': 0.0,
+                })
             continue
-        line, over_odds, under_odds, market_total, fair_over_prob, k = result
-        book_points.append({'book': book_name, 'line': line, 'fair_prob': fair_over_prob})
-        contributions.append({
-            'book': book_name, 'line': line, 'fair_prob': fair_over_prob,
-            'k': round(k, 4) if k else None,
-            'american_odds': prob_to_american(fair_over_prob)
-        })
 
-    if not book_points:
-        return None, None, []
+        line, _o, _u, _mt, fair_prob, _k = balanced
 
-    # Group by unique line — equal weight per book
-    by_line = defaultdict(list)
-    for pt in book_points:
-        by_line[pt['line']].append(pt['fair_prob'])
+        # Prefer the book's own slope (≥2 lines); otherwise borrow the pool.
+        own_slope = (e['slope'] if e and e['slope'] is not None
+                     and e['slope'] < 0 and e['n'] >= 2 else None)
+        slope = own_slope if own_slope is not None else global_slope
 
-    unique_points = sorted(
-        [(line, sum(probs) / len(probs)) for line, probs in by_line.items()]
-    )
-    lines = [p[0] for p in unique_points]
-    probs = [p[1] for p in unique_points]
+        if slope is not None:
+            line50 = line + (target_logit - _logit(fair_prob)) / slope
+        elif abs(fair_prob - prob_target) < 1e-6:
+            line50 = line              # already balanced; no projection needed
+        else:
+            # No dispersion anywhere and point isn't at target — best effort.
+            line50 = line
 
-    # Attempt interpolation for 50% crossing
-    for i in range(len(unique_points) - 1):
-        L0, p0 = lines[i],   probs[i]
-        L1, p1 = lines[i+1], probs[i+1]
-        if abs(p1 - p0) < 1e-9:
-            continue  # flat segment — no directional info
-        if (p0 < 0.50 < p1) or (p1 < 0.50 < p0):
-            t = (0.50 - p0) / (p1 - p0)
-            consensus_line = L0 + t * (L1 - L0)
-            return consensus_line, 0.50, contributions
+        # Balance confidence: a posted point near the target needs little
+        # projection and is the most reliable location signal.
+        weight = max(1.0 - 2.0 * abs(fair_prob - prob_target), 1e-3)
 
-    # Fallback A: every unique-line point is exactly at 50%
-    if all(abs(p - 0.50) < 1e-9 for p in probs):
-        all_lines = [pt['line'] for pt in book_points]
-        consensus_line = sum(all_lines) / len(all_lines)
-        return consensus_line, 0.50, contributions
+        contrib = {
+            'book': book_name,
+            'role': 'mean (own slope)' if own_slope is not None else 'mean (borrowed slope)',
+            'lines_used': e['n'] if e else 1,
+            'posted_line': round(line, 3),
+            'fair_prob': round(fair_prob, 4),
+            'fair_line_50%': round(line50, 3),
+            'slope': round(slope, 4) if slope is not None else None,
+            'r2': round(e['r2'], 3) if (e and e['r2'] is not None) else None,
+            'k': round(info['k'], 4) if info['k'] else None,
+            'weight': round(weight, 3),
+        }
+        contributions.append(contrib)
+        weighted_lines.append({'line50': line50, 'slope': slope,
+                               'weight': weight, 'contrib': contrib})
 
-    # Fallback B: no strict 50% crossing — book-count × probability weighted blend
-    counts = [len(by_line[line]) for line in lines]
-    weights = [counts[i] * probs[i] for i in range(len(lines))]
-    total_weight = sum(weights)
-    consensus_line = sum(weights[i] * lines[i] for i in range(len(lines))) / total_weight
-    consensus_prob = sum(counts[i] * probs[i] for i in range(len(lines))) / sum(counts)
-    return consensus_line, consensus_prob, contributions
+    if not weighted_lines:
+        return None, None, contributions
+
+    total_w = sum(e['weight'] for e in weighted_lines)
+    if total_w > 0:
+        consensus_line = sum(e['line50'] * e['weight'] for e in weighted_lines) / total_w
+    else:
+        consensus_line = sum(e['line50'] for e in weighted_lines) / len(weighted_lines)
+        for e in weighted_lines:
+            e['weight'] = 1.0
+        total_w = float(len(weighted_lines))
+
+    # Continuous models anchor at the fractional consensus 50% line.
+    if not discrete:
+        return consensus_line, prob_target, contributions
+
+    # Discrete models: snap to the nearest X.5 line and report the consensus
+    # probability there (generally not 50%), aggregating each two-way book's
+    # projected probability at that line.
+    snapped_line = float(np.floor(consensus_line) + 0.5)
+    num = den = 0.0
+    for e in weighted_lines:
+        if e['slope'] is not None:
+            x = e['slope'] * (snapped_line - e['line50'])
+            p_at = 1.0 / (1.0 + np.exp(-x))
+        else:
+            p_at = prob_target
+        e['contrib']['prob_at_anchor'] = round(p_at, 4)
+        num += p_at * e['weight']
+        den += e['weight']
+    consensus_prob = num / den if den > 0 else prob_target
+    return snapped_line, consensus_prob, contributions
 
 
 def get_prob_from_model(params, line, dist_name):
@@ -424,7 +593,8 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
         )
     else:
         consensus_line, consensus_prob, contributions = \
-            calculate_consensus_fair_value(book_dataframes)
+            calculate_consensus_fair_value(book_dataframes, book_ks, fallback_k,
+                                           discrete=(dist_type == 'Discrete'))
         if consensus_line is not None:
             fair_anchor_line = consensus_line
             fair_anchor_prob = consensus_prob
@@ -434,6 +604,19 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
                 f"({fair_anchor_prob:.2%})"
             )
             with st.expander("Consensus Calculation Details"):
+                st.caption(
+                    "Only **two-way books** set the consensus location (`role = mean`). "
+                    "Each posts a fair probability at its line; the **dispersion** "
+                    "(`slope` of log-odds vs line) borrowed from every multi-line "
+                    "ladder — including over-only books (`role = dispersion only`) — "
+                    "projects that point to the line where it prices 50/50 "
+                    "(`fair_line_50%`). A two-way book uses its own slope when it has "
+                    "≥2 lines, else the pooled global slope. The consensus is the "
+                    "balance-weighted average of the two-way books' projected lines. "
+                    "For **Discrete** models the consensus line is snapped to the "
+                    "nearest X.5 line and the anchor probability (`prob_at_anchor`) is "
+                    "the consensus probability at that line — generally not 50%."
+                )
                 contrib_df = pd.DataFrame(contributions)
                 st.dataframe(contrib_df)
         else:
@@ -648,22 +831,42 @@ def create_main_plot(results_df, selected_books, params):
 # ==============================================================================
 
 st.set_page_config(layout="wide")
-st.title("🎯 Advanced Prop Line Calculator v2.3")
+st.title("🎯 Advanced Prop Line Calculator v2.4")
 
-with st.expander("ℹ️ v2.3 — Power-Method Devigging"):
+with st.expander("ℹ️ v2.4 — Dispersion-Borrowing Consensus Anchor"):
     st.markdown("""
-    **What changed in v2.3:**
-    - **Power-method devigging** replaces the old constant-vig multiplicative approach.
-      Exponent *k* is solved from the most balanced two-sided market at each book
-      (`p_over^k + p_under^k = 1`), then applied to every alt line for that book.
-      This correctly concentrates more vig on longshots and less on heavy favourites.
-    - **Single analysis method** — removed redundant Multiplicative / Shape Retention
-      columns. All books now go through: power devig → fit distribution → location
-      shift to anchor.
-    - **Over-only books** (no two-sided line) use the *highest k* seen across other
-      books — the most conservative assumption about their vig level.
-    - **Consensus anchor** uses equal-weight linear interpolation across book lines
-      to find the 50 % crossing, rather than a weighted average of lines and probs.
+    **What changed in v2.4** (automatic anchor, used when *Manual Anchor Point* is off):
+
+    The consensus now separates two kinds of information and recombines them:
+
+    - **Location comes only from two-way books.** Books that post a genuine
+      two-sided market have reliable power-devig (both sides present), so only they
+      move the consensus mean. Over-only books no longer pull the location — their
+      one-sided devig has a biased absolute level.
+    - **Dispersion is borrowed from every multi-line ladder.** Each book with ≥2 alt
+      lines (including over-only ladders) contributes the slope of
+      `logit(P(X > line))` vs `line` — the implied spread of the stat. A one-sided
+      ladder's *slope* is robust even when its absolute level isn't.
+    - **Projection.** Each two-way book's posted point is projected to the line where
+      it would price 50/50 using the borrowed dispersion
+      (`L = line + (logit(0.5) − logit(fair_prob)) / slope`); a two-way book uses its
+      own slope when it has ≥2 lines, otherwise the line-count-weighted global slope.
+      The consensus is the balance-weighted average of those projected lines. This
+      sharpens the mean using deep alt ladders without letting biased one-sided
+      levels move it.
+    - **Discrete models snap to an X.5 line.** When *Distribution Type* is
+      **Discrete**, the consensus line is snapped to the nearest half-integer line
+      (0.5, 1.5, 2.5, …) and the anchor probability is the consensus probability
+      *at that line* (generally not 50%), so the anchor sits where `floor(line)` is
+      unambiguous for discrete CDFs rather than being treated continuously.
+
+    **Carried over from v2.3 — Power-method devigging:**
+    - Exponent *k* is solved from the most balanced two-sided market at each book
+      (`p_over^k + p_under^k = 1`), then applied to every alt line for that book,
+      concentrating more vig on longshots and less on heavy favourites.
+    - **Over-only books** use the *highest k* seen across other books — the most
+      conservative assumption about their vig level.
+    - All books go through: power devig → fit distribution → location shift to anchor.
     """)
 
 with st.sidebar:
