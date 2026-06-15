@@ -176,7 +176,8 @@ def estimate_book_fair_line(points, prob_target=0.50):
 
 
 def calculate_consensus_fair_value(book_dataframes, book_ks=None,
-                                   fallback_k=None, prob_target=0.50):
+                                   fallback_k=None, prob_target=0.50,
+                                   discrete=False):
     """
     Dispersion-borrowing consensus anchor.
 
@@ -203,6 +204,15 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
     borrows the line-count-weighted global slope pooled across all multi-line
     books. The consensus is the balance-weighted average of these projected
     lines across two-way books only.
+
+    Continuous models anchor at the (fractional) consensus 50% line.
+
+    Discrete models (`discrete=True`) instead snap the consensus line to the
+    nearest X.5 line and report the consensus probability AT that line — which is
+    generally NOT 50%. Each two-way book's probability at the snapped line is
+    computed from its own projected fair line + slope, then balance-weighted
+    averaged. This keeps the anchor on a real half-integer line where floor(line)
+    is unambiguous for discrete CDFs.
 
     `book_ks` / `fallback_k` come from run_analysis (the same k used elsewhere).
 
@@ -277,8 +287,7 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
         # projection and is the most reliable location signal.
         weight = max(1.0 - 2.0 * abs(fair_prob - prob_target), 1e-3)
 
-        weighted_lines.append((line50, weight))
-        contributions.append({
+        contrib = {
             'book': book_name,
             'role': 'mean (own slope)' if own_slope is not None else 'mean (borrowed slope)',
             'lines_used': e['n'] if e else 1,
@@ -289,16 +298,43 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
             'r2': round(e['r2'], 3) if (e and e['r2'] is not None) else None,
             'k': round(info['k'], 4) if info['k'] else None,
             'weight': round(weight, 3),
-        })
+        }
+        contributions.append(contrib)
+        weighted_lines.append({'line50': line50, 'slope': slope,
+                               'weight': weight, 'contrib': contrib})
 
     if not weighted_lines:
         return None, None, contributions
 
-    total_w = sum(w for _, w in weighted_lines)
-    consensus_line = (sum(L * w for L, w in weighted_lines) / total_w
-                      if total_w > 0
-                      else sum(L for L, _ in weighted_lines) / len(weighted_lines))
-    return consensus_line, prob_target, contributions
+    total_w = sum(e['weight'] for e in weighted_lines)
+    if total_w > 0:
+        consensus_line = sum(e['line50'] * e['weight'] for e in weighted_lines) / total_w
+    else:
+        consensus_line = sum(e['line50'] for e in weighted_lines) / len(weighted_lines)
+        for e in weighted_lines:
+            e['weight'] = 1.0
+        total_w = float(len(weighted_lines))
+
+    # Continuous models anchor at the fractional consensus 50% line.
+    if not discrete:
+        return consensus_line, prob_target, contributions
+
+    # Discrete models: snap to the nearest X.5 line and report the consensus
+    # probability there (generally not 50%), aggregating each two-way book's
+    # projected probability at that line.
+    snapped_line = float(np.floor(consensus_line) + 0.5)
+    num = den = 0.0
+    for e in weighted_lines:
+        if e['slope'] is not None:
+            x = e['slope'] * (snapped_line - e['line50'])
+            p_at = 1.0 / (1.0 + np.exp(-x))
+        else:
+            p_at = prob_target
+        e['contrib']['prob_at_anchor'] = round(p_at, 4)
+        num += p_at * e['weight']
+        den += e['weight']
+    consensus_prob = num / den if den > 0 else prob_target
+    return snapped_line, consensus_prob, contributions
 
 
 def get_prob_from_model(params, line, dist_name):
@@ -557,7 +593,8 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
         )
     else:
         consensus_line, consensus_prob, contributions = \
-            calculate_consensus_fair_value(book_dataframes, book_ks, fallback_k)
+            calculate_consensus_fair_value(book_dataframes, book_ks, fallback_k,
+                                           discrete=(dist_type == 'Discrete'))
         if consensus_line is not None:
             fair_anchor_line = consensus_line
             fair_anchor_prob = consensus_prob
@@ -575,7 +612,10 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
                     "projects that point to the line where it prices 50/50 "
                     "(`fair_line_50%`). A two-way book uses its own slope when it has "
                     "≥2 lines, else the pooled global slope. The consensus is the "
-                    "balance-weighted average of the two-way books' projected lines."
+                    "balance-weighted average of the two-way books' projected lines. "
+                    "For **Discrete** models the consensus line is snapped to the "
+                    "nearest X.5 line and the anchor probability (`prob_at_anchor`) is "
+                    "the consensus probability at that line — generally not 50%."
                 )
                 contrib_df = pd.DataFrame(contributions)
                 st.dataframe(contrib_df)
@@ -814,6 +854,11 @@ with st.expander("ℹ️ v2.4 — Dispersion-Borrowing Consensus Anchor"):
       The consensus is the balance-weighted average of those projected lines. This
       sharpens the mean using deep alt ladders without letting biased one-sided
       levels move it.
+    - **Discrete models snap to an X.5 line.** When *Distribution Type* is
+      **Discrete**, the consensus line is snapped to the nearest half-integer line
+      (0.5, 1.5, 2.5, …) and the anchor probability is the consensus probability
+      *at that line* (generally not 50%), so the anchor sits where `floor(line)` is
+      unambiguous for discrete CDFs rather than being treated continuously.
 
     **Carried over from v2.3 — Power-method devigging:**
     - Exponent *k* is solved from the most balanced two-sided market at each book
