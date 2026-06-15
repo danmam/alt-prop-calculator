@@ -27,6 +27,8 @@ if 'selected_books' not in st.session_state:
     st.session_state.selected_books = []
 if 'analysis_params' not in st.session_state:
     st.session_state.analysis_params = {}
+if 'last_excluded' not in st.session_state:
+    st.session_state.last_excluded = set()
 
 DEFAULT_MAE_THRESHOLD = 0.05
 DEFAULT_VIG_MARKET_TOTAL = 1.071   # fallback if no two-sided lines found anywhere
@@ -177,51 +179,63 @@ def estimate_book_fair_line(points, prob_target=0.50):
 
 def calculate_consensus_fair_value(book_dataframes, book_ks=None,
                                    fallback_k=None, prob_target=0.50,
-                                   discrete=False):
+                                   discrete=False, book_fits=None,
+                                   line_bounds=None):
     """
-    Dispersion-borrowing consensus anchor.
+    Distribution-based consensus anchor.
 
     Two distinct kinds of information are separated and recombined:
 
       * LOCATION (mean) — only books that post a genuine two-sided market
         contribute to where the consensus line sits. Their power-devig is
         reliable (both sides present), so their fair probability at the posted
-        line is trustworthy.
+        line is trustworthy. One-sided ladders never move the location, since
+        their absolute level is biased by the approximate over-only devig.
 
-      * DISPERSION (variance/shape) — every book with multiple alt lines,
-        INCLUDING over-only ladders, contributes its slope d·logit(P(X>line))/d·line.
-        That slope encodes how quickly fair probability changes per unit of line,
-        i.e. the implied spread of the stat. A one-sided ladder's absolute level
-        may be biased by the approximate devig, but its *slope* is robust — so we
-        borrow only the slope from those deep ladders.
+      * SHAPE (variance/skew) — taken from the actual fitted distributions, NOT
+        a logit-linear slope. Every multi-line book (including over-only ladders)
+        is fit upstream by run_analysis; those fits carry curvature, skew and —
+        for discrete families — integer mass that a logit line cannot. The
+        best-fitting multi-line book is the reference SHAPE donor.
 
-    The borrowed dispersion is then used to project each two-way book's posted
-    point (line, fair_prob) to the line where it would price `prob_target`:
+    Per two-way book the implied fair line is the MEDIAN of a fitted distribution
+    (where P(X > L) = prob_target):
+      * a two-way book with its own multi-line fit uses that fit directly;
+      * a single-line two-way book borrows the donor SHAPE, relocated to its own
+        posted point via solve_location_shift(), then read for its median.
+    The consensus line is the confidence-weighted average of those medians.
 
-        L_target = line + (logit(prob_target) - logit(fair_prob)) / slope
+    Continuous models anchor at the (fractional) consensus median.
 
-    A two-way book uses its OWN slope if its ladder has ≥2 lines; otherwise it
-    borrows the line-count-weighted global slope pooled across all multi-line
-    books. The consensus is the balance-weighted average of these projected
-    lines across two-way books only.
+    Discrete models (`discrete=True`) snap the consensus line to the nearest X.5
+    line and report the consensus probability AT that line — generally NOT 50% —
+    by evaluating each two-way book's (own or relocated) fitted CDF at the snapped
+    line, then confidence-weighted averaging. This keeps the anchor on a real
+    half-integer line where floor(line) is unambiguous for discrete CDFs.
 
-    Continuous models anchor at the (fractional) consensus 50% line.
+    A logit-linear slope (estimate_book_fair_line) is retained only as a fallback
+    when no distribution fit is available.
 
-    Discrete models (`discrete=True`) instead snap the consensus line to the
-    nearest X.5 line and report the consensus probability AT that line — which is
-    generally NOT 50%. Each two-way book's probability at the snapped line is
-    computed from its own projected fair line + slope, then balance-weighted
-    averaged. This keeps the anchor on a real half-integer line where floor(line)
-    is unambiguous for discrete CDFs.
-
-    `book_ks` / `fallback_k` come from run_analysis (the same k used elsewhere).
+    `book_ks` / `fallback_k` / `book_fits` / `line_bounds` come from run_analysis.
 
     Returns: (consensus_line, consensus_prob, contributions_list)
     """
     book_ks      = book_ks or {}
+    book_fits    = book_fits or {}
     target_logit = _logit(prob_target)
 
-    # ── 1. Per-book devigged over ladder, slope estimate, and two-way point ────
+    # Widen the median search range beyond the observed lines.
+    all_lines = [float(L) for m in book_dataframes.values()
+                 for L in m['line'].dropna().tolist()]
+    if line_bounds is not None:
+        lo0, hi0 = line_bounds
+    elif all_lines:
+        lo0, hi0 = min(all_lines), max(all_lines)
+    else:
+        lo0, hi0 = 0.0, 100.0
+    search_bounds = (lo0 - 30.0, hi0 + 30.0)
+
+    # ── 1. Per-book devigged ladder (for fallback slope) and two-way point ─────
     per_book = {}
     for book_name, market_df in book_dataframes.items():
         k = book_ks.get(book_name, fallback_k)
@@ -233,36 +247,46 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
         pts = [(row['line'], american_to_prob(row['odds']) ** k)
                for _, row in over_df.iterrows() if pd.notna(row['odds'])]
         est = estimate_book_fair_line(pts, prob_target) if pts else None
-
         balanced = find_most_balanced_two_way_market(market_df)  # None if one-sided
         per_book[book_name] = {'k': k, 'est': est, 'balanced': balanced}
 
-    # ── 2. Pool DISPERSION from every multi-line book (slope of logit vs line) ──
-    slope_donors = []
-    for book_name, info in per_book.items():
-        e = info['est']
-        if e and e['slope'] is not None and e['slope'] < 0 and e['n'] >= 2:
-            conf = e['n'] * (max(e['r2'], 0.1) if e['r2'] is not None else 1.0)
-            slope_donors.append((e['slope'], conf))
-    global_slope = (sum(s * c for s, c in slope_donors) / sum(c for _, c in slope_donors)
+    # ── 2. Choose the reference SHAPE donor: best multi-line fit ───────────────
+    #    (most lines, tie-broken by lowest unshifted MAE).
+    donor = None
+    for book_name, fit in book_fits.items():
+        if not fit:
+            continue
+        n_lines = per_book.get(book_name, {}).get('est')
+        n_lines = n_lines['n'] if n_lines else 0
+        key = (n_lines, -fit.get('mae', float('inf')))
+        if donor is None or key > donor['key']:
+            donor = {'key': key, 'book': book_name,
+                     'dist': fit['dist_name'], 'params': fit['params']}
+
+    # Pooled logit slope — fallback only.
+    slope_donors = [(e['slope'], e['n']) for info in per_book.values()
+                    if (e := info['est']) and e['slope'] is not None
+                    and e['slope'] < 0 and e['n'] >= 2]
+    global_slope = (sum(s * n for s, n in slope_donors) / sum(n for _, n in slope_donors)
                     if slope_donors else None)
 
-    # ── 3. LOCATION from two-way books only, projected with borrowed dispersion ─
-    contributions  = []
-    weighted_lines = []
+    # ── 3. LOCATION from two-way books only, via fitted-distribution medians ───
+    contributions = []
+    weighted      = []
     for book_name, info in per_book.items():
         balanced = info['balanced']
         e        = info['est']
+        own_fit  = book_fits.get(book_name)
 
         if balanced is None:
-            # Over-only book: dispersion donor only — never moves the mean.
-            if e and e['slope'] is not None:
+            # One-sided book — contributes shape only, never the location.
+            if own_fit or (e and e['slope'] is not None):
                 contributions.append({
-                    'book': book_name, 'role': 'dispersion only',
-                    'lines_used': e['n'], 'posted_line': None,
-                    'fair_prob': None, 'fair_line_50%': None,
-                    'slope': round(e['slope'], 4),
-                    'r2': round(e['r2'], 3) if e['r2'] is not None else None,
+                    'book': book_name,
+                    'role': 'shape donor' if own_fit else 'dispersion only',
+                    'lines_used': e['n'] if e else 0,
+                    'posted_line': None, 'fair_prob': None, 'fair_line_50%': None,
+                    'model': own_fit['dist_name'] if own_fit else None,
                     'k': round(info['k'], 4) if info['k'] else None,
                     'weight': 0.0,
                 })
@@ -270,69 +294,77 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
 
         line, _o, _u, _mt, fair_prob, _k = balanced
 
-        # Prefer the book's own slope (≥2 lines); otherwise borrow the pool.
-        own_slope = (e['slope'] if e and e['slope'] is not None
-                     and e['slope'] < 0 and e['n'] >= 2 else None)
-        slope = own_slope if own_slope is not None else global_slope
+        # Pick this book's distribution: its own fit, else the borrowed donor.
+        dist = params = None
+        if own_fit:
+            dist, params, src = own_fit['dist_name'], own_fit['params'], 'own fit'
+        elif donor is not None:
+            dist = donor['dist']
+            params = solve_location_shift(donor['params'], dist, line, fair_prob)
+            src = f"borrowed {donor['book']}"
 
-        if slope is not None:
-            line50 = line + (target_logit - _logit(fair_prob)) / slope
-        elif abs(fair_prob - prob_target) < 1e-6:
-            line50 = line              # already balanced; no projection needed
-        else:
-            # No dispersion anywhere and point isn't at target — best effort.
-            line50 = line
+        median = model_median(params, dist, search_bounds, prob_target) \
+                 if params is not None else None
 
-        # Balance confidence: a posted point near the target needs little
-        # projection and is the most reliable location signal.
-        weight = max(1.0 - 2.0 * abs(fair_prob - prob_target), 1e-3)
+        # Fallback to the logit-linear slope if no usable distribution median.
+        if median is None:
+            own_slope = (e['slope'] if e and e['slope'] is not None
+                         and e['slope'] < 0 and e['n'] >= 2 else None)
+            slope_fb = own_slope if own_slope is not None else global_slope
+            if slope_fb is not None:
+                median = line + (target_logit - _logit(fair_prob)) / slope_fb
+                src = 'logit slope'
+            else:
+                median = line
+                src = 'posted line'
+
+        # Confidence: number of lines × balance of the posted point (a near-50/50
+        # two-way line is the most reliable location signal).
+        n_lines = e['n'] if e else 1
+        weight  = n_lines * max(1.0 - 2.0 * abs(fair_prob - prob_target), 0.05)
 
         contrib = {
             'book': book_name,
-            'role': 'mean (own slope)' if own_slope is not None else 'mean (borrowed slope)',
-            'lines_used': e['n'] if e else 1,
+            'role': f'mean ({src})',
+            'lines_used': n_lines,
             'posted_line': round(line, 3),
             'fair_prob': round(fair_prob, 4),
-            'fair_line_50%': round(line50, 3),
-            'slope': round(slope, 4) if slope is not None else None,
-            'r2': round(e['r2'], 3) if (e and e['r2'] is not None) else None,
+            'fair_line_50%': round(median, 3),
+            'model': dist,
             'k': round(info['k'], 4) if info['k'] else None,
             'weight': round(weight, 3),
         }
         contributions.append(contrib)
-        weighted_lines.append({'line50': line50, 'slope': slope,
-                               'weight': weight, 'contrib': contrib})
+        weighted.append({'median': median, 'dist': dist, 'params': params,
+                         'weight': weight, 'contrib': contrib})
 
-    if not weighted_lines:
+    if not weighted:
         return None, None, contributions
 
-    total_w = sum(e['weight'] for e in weighted_lines)
+    total_w = sum(w['weight'] for w in weighted)
     if total_w > 0:
-        consensus_line = sum(e['line50'] * e['weight'] for e in weighted_lines) / total_w
+        consensus_line = sum(w['median'] * w['weight'] for w in weighted) / total_w
     else:
-        consensus_line = sum(e['line50'] for e in weighted_lines) / len(weighted_lines)
-        for e in weighted_lines:
-            e['weight'] = 1.0
-        total_w = float(len(weighted_lines))
+        consensus_line = sum(w['median'] for w in weighted) / len(weighted)
+        for w in weighted:
+            w['weight'] = 1.0
 
-    # Continuous models anchor at the fractional consensus 50% line.
+    # Continuous models anchor at the fractional consensus median.
     if not discrete:
         return consensus_line, prob_target, contributions
 
-    # Discrete models: snap to the nearest X.5 line and report the consensus
-    # probability there (generally not 50%), aggregating each two-way book's
-    # projected probability at that line.
+    # Discrete: snap to the nearest X.5 line; report the consensus probability
+    # there, read from each two-way book's actual fitted CDF.
     snapped_line = float(np.floor(consensus_line) + 0.5)
     num = den = 0.0
-    for e in weighted_lines:
-        if e['slope'] is not None:
-            x = e['slope'] * (snapped_line - e['line50'])
-            p_at = 1.0 / (1.0 + np.exp(-x))
-        else:
-            p_at = prob_target
-        e['contrib']['prob_at_anchor'] = round(p_at, 4)
-        num += p_at * e['weight']
-        den += e['weight']
+    for w in weighted:
+        p_at = (get_prob_from_model(w['params'], snapped_line, w['dist'])
+                if w['params'] is not None else None)
+        if p_at is None or not (0.0 <= p_at <= 1.0) or np.isnan(p_at):
+            p_at = prob_target   # degenerate — fall back to the target
+        w['contrib']['prob_at_anchor'] = round(float(p_at), 4)
+        num += p_at * w['weight']
+        den += w['weight']
     consensus_prob = num / den if den > 0 else prob_target
     return snapped_line, consensus_prob, contributions
 
@@ -354,6 +386,36 @@ def get_prob_from_model(params, line, dist_name):
         else:
             return np.nan
     return 1.0 - prob_le_k
+
+
+def model_median(params, dist_name, line_bounds, prob_target=0.50, n_grid=1200):
+    """
+    Line at which a fitted distribution prices P(X > line) == prob_target.
+
+    Evaluated on a grid and linearly interpolated rather than root-solved, which
+    stays robust for the step-shaped CDFs of discrete distributions (where a
+    smooth solver would stall on flat segments). Returns None if the target is
+    never crossed within line_bounds.
+    """
+    lo, hi = line_bounds
+    xs = np.linspace(lo, hi, n_grid)
+    ps = np.array([get_prob_from_model(params, float(x), dist_name) for x in xs])
+
+    # Discrete CDFs are flat across each integer interval, so the target can be
+    # hit over a whole range — return the centre of that range (e.g. the 27.5
+    # mid-point of [27, 28) rather than its left edge).
+    at_target = np.isclose(ps, prob_target, atol=1e-6)
+    if at_target.any():
+        idx = np.where(at_target)[0]
+        return float((xs[idx[0]] + xs[idx[-1]]) / 2.0)
+
+    # Otherwise interpolate the strict crossing (continuous distributions).
+    for i in range(len(xs) - 1):
+        a, b = ps[i] - prob_target, ps[i + 1] - prob_target
+        if a * b < 0 and ps[i] != ps[i + 1]:
+            t = (prob_target - ps[i]) / (ps[i + 1] - ps[i])
+            return float(xs[i] + t * (xs[i + 1] - xs[i]))
+    return None
 
 
 def fit_model(market_df, dist_name, target_col='fair_prob'):
@@ -500,15 +562,19 @@ def display_results_table(results_df, selected_books):
 # ==============================================================================
 
 def run_analysis(df, use_anchor, anchor_line, anchor_odds,
-                 target_line, dist_type, mae_threshold, show_individual_plots):
+                 target_line, dist_type, mae_threshold, show_individual_plots,
+                 consensus_excluded=None):
     """
-    Core analysis pipeline — v2.3:
+    Core analysis pipeline — v2.4:
       1. Load books; compute per-book power-devig k from two-sided market.
       2. Over-only books use the highest k observed across all other books.
-      3. Compute consensus anchor via interpolation (or use manual anchor).
-      4. For each book: power-devig all alt lines → fit distribution →
-         shift location to anchor → report P(X > target_line).
+      3. Fit each multi-line book's distributions once (unshifted).
+      4. Compute consensus anchor from the fitted distributions (or manual anchor).
+         Books in `consensus_excluded` are dropped from the consensus only — they
+         are still fit, shifted and displayed, just no longer influence the anchor.
+      5. For each book: shift fit to anchor → report P(X > target_line).
     """
+    consensus_excluded = set(consensus_excluded or [])
     # ── 1. Load book data ──────────────────────────────────────────────────────
     line_col   = pd.to_numeric(df.iloc[:, 0], errors='coerce')
     total_cols = df.shape[1]
@@ -583,7 +649,49 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
             f"   Using {k_src} for devigging — results are approximate upper bounds on fair prob."
         )
 
-    # ── 3. Determine fair-value anchor ─────────────────────────────────────────
+    # ── 3. Distributions to test ───────────────────────────────────────────────
+    if dist_type == 'Discrete':
+        models_to_test = ['poisson', 'nbinom']
+    else:
+        models_to_test = ['norm', 'lognorm', 'gamma', 'skewnorm']
+        if SKEWT_AVAILABLE and max(book_alt_line_counts.values(), default=0) >= 5:
+            models_to_test.append('skewt')
+
+    # ── 4. Pre-fit each multi-line book's distributions (unshifted) ────────────
+    #    Fit once here so the consensus can use real distribution shapes and the
+    #    evaluation loop below can reuse the same fits without refitting.
+    book_working  = {}   # book -> power-devigged working df
+    book_all_fits = {}   # book -> {dist_name: params}
+    book_best_fit = {}   # book -> {'dist_name', 'params', 'mae'} (best unshifted)
+    for book in books:
+        if book_alt_line_counts[book] < MIN_ALT_LINES:
+            continue
+        k   = book_ks.get(book, fallback_k)
+        wdf = book_dataframes[book].copy()
+        wdf['prob']      = wdf['odds'].apply(american_to_prob)
+        wdf['fair_prob'] = wdf['prob'].apply(lambda p: p ** k)
+        book_working[book] = wdf
+        over_df = wdf[wdf['type'] == 'over']
+
+        fits, best = {}, None
+        for dist_name in models_to_test:
+            try:
+                params = fit_model(wdf, dist_name, target_col='fair_prob')
+            except Exception:
+                params = None
+            if params is None:
+                continue
+            fits[dist_name] = params
+            mp  = np.array([get_prob_from_model(params, x, dist_name)
+                            for x in over_df['line'].values])
+            mae = float(np.mean(np.abs(over_df['fair_prob'].values - mp)))
+            if best is None or mae < best['mae']:
+                best = {'dist_name': dist_name, 'params': params, 'mae': mae}
+        book_all_fits[book] = fits
+        if best:
+            book_best_fit[book] = best
+
+    # ── 5. Determine fair-value anchor ─────────────────────────────────────────
     if use_anchor:
         fair_anchor_line = anchor_line
         fair_anchor_prob = american_to_prob(anchor_odds)
@@ -592,9 +700,20 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
             f"({fair_anchor_prob:.2%})"
         )
     else:
+        # Consensus uses every book except those the user has de-selected.
+        cons_bdf  = {b: m for b, m in book_dataframes.items()
+                     if b not in consensus_excluded}
+        cons_fits = {b: f for b, f in book_best_fit.items()
+                     if b not in consensus_excluded}
         consensus_line, consensus_prob, contributions = \
-            calculate_consensus_fair_value(book_dataframes, book_ks, fallback_k,
-                                           discrete=(dist_type == 'Discrete'))
+            calculate_consensus_fair_value(
+                cons_bdf, book_ks, fallback_k,
+                discrete=(dist_type == 'Discrete'),
+                book_fits=cons_fits,
+                line_bounds=(float(line_col.min()), float(line_col.max())))
+        if consensus_excluded:
+            st.caption(f"Consensus excludes de-selected book(s): "
+                       f"{', '.join(sorted(consensus_excluded))}")
         if consensus_line is not None:
             fair_anchor_line = consensus_line
             fair_anchor_prob = consensus_prob
@@ -605,17 +724,15 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
             )
             with st.expander("Consensus Calculation Details"):
                 st.caption(
-                    "Only **two-way books** set the consensus location (`role = mean`). "
-                    "Each posts a fair probability at its line; the **dispersion** "
-                    "(`slope` of log-odds vs line) borrowed from every multi-line "
-                    "ladder — including over-only books (`role = dispersion only`) — "
-                    "projects that point to the line where it prices 50/50 "
-                    "(`fair_line_50%`). A two-way book uses its own slope when it has "
-                    "≥2 lines, else the pooled global slope. The consensus is the "
-                    "balance-weighted average of the two-way books' projected lines. "
-                    "For **Discrete** models the consensus line is snapped to the "
-                    "nearest X.5 line and the anchor probability (`prob_at_anchor`) is "
-                    "the consensus probability at that line — generally not 50%."
+                    "Only **two-way books** set the consensus location (`role = mean …`). "
+                    "Each book's fair line (`fair_line_50%`) is the **median of a fitted "
+                    "distribution** (`model`): a two-way book with ≥2 lines uses its own "
+                    "fit; a single-line two-way book borrows the best multi-line fit "
+                    "(`role = shape donor`), relocated to its posted point. The consensus "
+                    "is the confidence-weighted average of those medians (weight = lines × "
+                    "balance). For **Discrete** models the consensus line is snapped to "
+                    "the nearest X.5 line and the anchor probability (`prob_at_anchor`) is "
+                    "read from each book's fitted CDF at that line — generally not 50%."
                 )
                 contrib_df = pd.DataFrame(contributions)
                 st.dataframe(contrib_df)
@@ -624,15 +741,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
             fair_anchor_line = None
             fair_anchor_prob = None
 
-    # ── 4. Distributions to test ───────────────────────────────────────────────
-    if dist_type == 'Discrete':
-        models_to_test = ['poisson', 'nbinom']
-    else:
-        models_to_test = ['norm', 'lognorm', 'gamma', 'skewnorm']
-        if SKEWT_AVAILABLE and max(book_alt_line_counts.values(), default=0) >= 5:
-            models_to_test.append('skewt')
-
-    # ── 5. Fitting loop ────────────────────────────────────────────────────────
+    # ── 6. Evaluation: shift each pre-fit to the anchor, pick best, score ──────
     all_results      = []
     single_line_books = []
 
@@ -642,9 +751,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
     for i, book in enumerate(books):
         progress_bar.progress(min((i + 1) / total_iterations, 1.0))
 
-        market_df  = book_dataframes[book]
-        k          = book_ks.get(book, fallback_k)
-        num_lines  = book_alt_line_counts[book]
+        num_lines = book_alt_line_counts[book]
 
         if num_lines < MIN_ALT_LINES:
             single_line_books.append(book)
@@ -656,21 +763,15 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
                 })
             continue
 
-        # Power-devig all lines for this book
-        working_df          = market_df.copy()
-        working_df['prob']      = working_df['odds'].apply(american_to_prob)
-        working_df['fair_prob'] = working_df['prob'].apply(lambda p: p ** k)
+        working_df = book_working[book]
+        over_df    = working_df[working_df['type'] == 'over']
 
         best_model = None
         min_mae    = float('inf')
 
-        for dist_name in models_to_test:
+        for dist_name, params in book_all_fits.get(book, {}).items():
             try:
-                params = fit_model(working_df, dist_name, target_col='fair_prob')
-                if params is None:
-                    continue
-
-                # Shift distribution to consensus / manual anchor
+                # Shift the (already-fit) distribution to consensus / manual anchor
                 final_params = params
                 if fair_anchor_prob is not None:
                     final_params = solve_location_shift(
@@ -678,7 +779,6 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
                     )
 
                 # MAE against power-devigged over probs
-                over_df     = working_df[working_df['type'] == 'over']
                 model_probs = np.array([
                     get_prob_from_model(final_params, x, dist_name)
                     for x in over_df['line'].values
@@ -714,7 +814,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
     # Store in session state for dynamic display
     st.session_state.results_df      = res_df
     st.session_state.available_books = [b for b in books if b not in single_line_books]
-    st.session_state.selected_books  = st.session_state.available_books.copy()
+    # NB: selected_books is managed by the UI so a consensus re-run does not reset it.
     st.session_state.analysis_params = {
         'book_dataframes':    book_dataframes,
         'book_ks':            book_ks,
@@ -833,32 +933,33 @@ def create_main_plot(results_df, selected_books, params):
 st.set_page_config(layout="wide")
 st.title("🎯 Advanced Prop Line Calculator v2.4")
 
-with st.expander("ℹ️ v2.4 — Dispersion-Borrowing Consensus Anchor"):
+with st.expander("ℹ️ v2.4 — Distribution-Based Consensus Anchor"):
     st.markdown("""
     **What changed in v2.4** (automatic anchor, used when *Manual Anchor Point* is off):
 
-    The consensus now separates two kinds of information and recombines them:
+    The consensus separates two kinds of information and recombines them, using the
+    **actual fitted distributions** rather than a logit-linear approximation:
 
     - **Location comes only from two-way books.** Books that post a genuine
       two-sided market have reliable power-devig (both sides present), so only they
       move the consensus mean. Over-only books no longer pull the location — their
       one-sided devig has a biased absolute level.
-    - **Dispersion is borrowed from every multi-line ladder.** Each book with ≥2 alt
-      lines (including over-only ladders) contributes the slope of
-      `logit(P(X > line))` vs `line` — the implied spread of the stat. A one-sided
-      ladder's *slope* is robust even when its absolute level isn't.
-    - **Projection.** Each two-way book's posted point is projected to the line where
-      it would price 50/50 using the borrowed dispersion
-      (`L = line + (logit(0.5) − logit(fair_prob)) / slope`); a two-way book uses its
-      own slope when it has ≥2 lines, otherwise the line-count-weighted global slope.
-      The consensus is the balance-weighted average of those projected lines. This
-      sharpens the mean using deep alt ladders without letting biased one-sided
-      levels move it.
+    - **Shape comes from the fitted distributions.** Every multi-line book
+      (including over-only ladders) is fit upstream; those fits carry curvature,
+      skew, and — for discrete families — integer mass that a straight log-odds line
+      cannot. The best-fitting multi-line book is the reference *shape donor*.
+    - **Each two-way book's fair line is a fitted median.** A two-way book with ≥2
+      lines uses its own fitted distribution's median (where `P(X > L) = 0.5`); a
+      single-line two-way book borrows the donor shape, relocated to its posted
+      point, and reads that median. The consensus is the confidence-weighted average
+      of those medians (weight = lines × balance). This is materially more accurate
+      than a linear slope when projecting offset two-way lines over many points,
+      because real stat distributions are skewed.
     - **Discrete models snap to an X.5 line.** When *Distribution Type* is
       **Discrete**, the consensus line is snapped to the nearest half-integer line
-      (0.5, 1.5, 2.5, …) and the anchor probability is the consensus probability
-      *at that line* (generally not 50%), so the anchor sits where `floor(line)` is
-      unambiguous for discrete CDFs rather than being treated continuously.
+      (0.5, 1.5, 2.5, …) and the anchor probability is read from each book's fitted
+      CDF *at that line* (generally not 50%), so the anchor sits where `floor(line)`
+      is unambiguous for discrete CDFs rather than being treated continuously.
 
     **Carried over from v2.3 — Power-method devigging:**
     - Exponent *k* is solved from the most balanced two-sided market at each book
@@ -904,6 +1005,8 @@ with st.sidebar:
         st.session_state.results_df     = None
         st.session_state.available_books = []
         st.session_state.selected_books  = []
+        st.session_state.last_excluded   = set()
+        st.session_state.pop("book_selector", None)  # reset multiselect widget
 
 if uploaded_file is not None:
     try:
@@ -916,16 +1019,22 @@ if uploaded_file is not None:
 
         if st.session_state.analysis_run:
             if st.session_state.results_df is None:
+                # Fresh run from the button: consensus uses every book.
                 run_analysis(df, use_anchor, anchor_line, anchor_odds,
-                             target_line, dist_type, mae_threshold, show_individual)
+                             target_line, dist_type, mae_threshold, show_individual,
+                             consensus_excluded=set())
+                st.session_state.selected_books = list(st.session_state.available_books)
+                st.session_state.last_excluded  = set()
 
             if (st.session_state.results_df is not None
                     and len(st.session_state.available_books) > 0):
 
                 st.header("Results")
                 st.subheader("Select Books for Average")
+                st.caption("De-selecting a book also removes it from the consensus "
+                           "anchor (the analysis re-runs automatically).")
                 selected = st.multiselect(
-                    "Books to include in average:",
+                    "Books to include in average & consensus:",
                     options=st.session_state.available_books,
                     default=st.session_state.selected_books,
                     key="book_selector"
@@ -933,6 +1042,16 @@ if uploaded_file is not None:
                 st.session_state.selected_books = selected
                 if not selected:
                     st.warning("⚠️ No books selected.")
+
+                # If the selection changed, re-run so the consensus anchor (and the
+                # location shift it drives for every book) reflects only the kept books.
+                excluded = set(st.session_state.available_books) - set(selected)
+                if not use_anchor and excluded != st.session_state.last_excluded:
+                    run_analysis(df, use_anchor, anchor_line, anchor_odds,
+                                 target_line, dist_type, mae_threshold, show_individual,
+                                 consensus_excluded=excluded)
+                    st.session_state.last_excluded  = excluded
+                    st.session_state.selected_books = selected
 
                 st.subheader("Fair Value Results")
                 display_results_table(st.session_state.results_df, selected)
