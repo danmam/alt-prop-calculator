@@ -27,6 +27,8 @@ if 'selected_books' not in st.session_state:
     st.session_state.selected_books = []
 if 'analysis_params' not in st.session_state:
     st.session_state.analysis_params = {}
+if 'last_excluded' not in st.session_state:
+    st.session_state.last_excluded = set()
 
 DEFAULT_MAE_THRESHOLD = 0.05
 DEFAULT_VIG_MARKET_TOTAL = 1.071   # fallback if no two-sided lines found anywhere
@@ -560,15 +562,19 @@ def display_results_table(results_df, selected_books):
 # ==============================================================================
 
 def run_analysis(df, use_anchor, anchor_line, anchor_odds,
-                 target_line, dist_type, mae_threshold, show_individual_plots):
+                 target_line, dist_type, mae_threshold, show_individual_plots,
+                 consensus_excluded=None):
     """
-    Core analysis pipeline — v2.3:
+    Core analysis pipeline — v2.4:
       1. Load books; compute per-book power-devig k from two-sided market.
       2. Over-only books use the highest k observed across all other books.
-      3. Compute consensus anchor via interpolation (or use manual anchor).
-      4. For each book: power-devig all alt lines → fit distribution →
-         shift location to anchor → report P(X > target_line).
+      3. Fit each multi-line book's distributions once (unshifted).
+      4. Compute consensus anchor from the fitted distributions (or manual anchor).
+         Books in `consensus_excluded` are dropped from the consensus only — they
+         are still fit, shifted and displayed, just no longer influence the anchor.
+      5. For each book: shift fit to anchor → report P(X > target_line).
     """
+    consensus_excluded = set(consensus_excluded or [])
     # ── 1. Load book data ──────────────────────────────────────────────────────
     line_col   = pd.to_numeric(df.iloc[:, 0], errors='coerce')
     total_cols = df.shape[1]
@@ -694,12 +700,20 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
             f"({fair_anchor_prob:.2%})"
         )
     else:
+        # Consensus uses every book except those the user has de-selected.
+        cons_bdf  = {b: m for b, m in book_dataframes.items()
+                     if b not in consensus_excluded}
+        cons_fits = {b: f for b, f in book_best_fit.items()
+                     if b not in consensus_excluded}
         consensus_line, consensus_prob, contributions = \
             calculate_consensus_fair_value(
-                book_dataframes, book_ks, fallback_k,
+                cons_bdf, book_ks, fallback_k,
                 discrete=(dist_type == 'Discrete'),
-                book_fits=book_best_fit,
+                book_fits=cons_fits,
                 line_bounds=(float(line_col.min()), float(line_col.max())))
+        if consensus_excluded:
+            st.caption(f"Consensus excludes de-selected book(s): "
+                       f"{', '.join(sorted(consensus_excluded))}")
         if consensus_line is not None:
             fair_anchor_line = consensus_line
             fair_anchor_prob = consensus_prob
@@ -800,7 +814,7 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
     # Store in session state for dynamic display
     st.session_state.results_df      = res_df
     st.session_state.available_books = [b for b in books if b not in single_line_books]
-    st.session_state.selected_books  = st.session_state.available_books.copy()
+    # NB: selected_books is managed by the UI so a consensus re-run does not reset it.
     st.session_state.analysis_params = {
         'book_dataframes':    book_dataframes,
         'book_ks':            book_ks,
@@ -991,6 +1005,8 @@ with st.sidebar:
         st.session_state.results_df     = None
         st.session_state.available_books = []
         st.session_state.selected_books  = []
+        st.session_state.last_excluded   = set()
+        st.session_state.pop("book_selector", None)  # reset multiselect widget
 
 if uploaded_file is not None:
     try:
@@ -1003,16 +1019,22 @@ if uploaded_file is not None:
 
         if st.session_state.analysis_run:
             if st.session_state.results_df is None:
+                # Fresh run from the button: consensus uses every book.
                 run_analysis(df, use_anchor, anchor_line, anchor_odds,
-                             target_line, dist_type, mae_threshold, show_individual)
+                             target_line, dist_type, mae_threshold, show_individual,
+                             consensus_excluded=set())
+                st.session_state.selected_books = list(st.session_state.available_books)
+                st.session_state.last_excluded  = set()
 
             if (st.session_state.results_df is not None
                     and len(st.session_state.available_books) > 0):
 
                 st.header("Results")
                 st.subheader("Select Books for Average")
+                st.caption("De-selecting a book also removes it from the consensus "
+                           "anchor (the analysis re-runs automatically).")
                 selected = st.multiselect(
-                    "Books to include in average:",
+                    "Books to include in average & consensus:",
                     options=st.session_state.available_books,
                     default=st.session_state.selected_books,
                     key="book_selector"
@@ -1020,6 +1042,16 @@ if uploaded_file is not None:
                 st.session_state.selected_books = selected
                 if not selected:
                     st.warning("⚠️ No books selected.")
+
+                # If the selection changed, re-run so the consensus anchor (and the
+                # location shift it drives for every book) reflects only the kept books.
+                excluded = set(st.session_state.available_books) - set(selected)
+                if not use_anchor and excluded != st.session_state.last_excluded:
+                    run_analysis(df, use_anchor, anchor_line, anchor_odds,
+                                 target_line, dist_type, mae_threshold, show_individual,
+                                 consensus_excluded=excluded)
+                    st.session_state.last_excluded  = excluded
+                    st.session_state.selected_books = selected
 
                 st.subheader("Fair Value Results")
                 display_results_table(st.session_state.results_df, selected)
