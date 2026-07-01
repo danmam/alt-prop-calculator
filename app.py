@@ -299,9 +299,15 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
         line, _o, _u, _mt, fair_prob, _k = balanced
 
         # Pick this book's distribution: its own fit, else the borrowed donor.
+        # Either way, relocate it to match this book's own directly-devigged
+        # two-way price exactly — a raw multi-line least-squares fit is not
+        # guaranteed to pass through that (most-trusted) point, and can disagree
+        # with it when the overall curve fit is loose.
         dist = params = None
         if own_fit:
-            dist, params, src = own_fit['dist_name'], own_fit['params'], 'own fit'
+            dist = own_fit['dist_name']
+            params = relocate_to_two_way(own_fit['params'], dist, line, fair_prob, discrete)
+            src = 'own fit'
         elif donor is not None:
             dist = donor['dist']
             params = relocate_to_two_way(donor['params'], dist, line, fair_prob, discrete)
