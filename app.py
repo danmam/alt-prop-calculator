@@ -203,7 +203,9 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
       * a two-way book with its own multi-line fit uses that fit directly;
       * a single-line two-way book borrows the donor SHAPE, relocated to its own
         posted point via solve_location_shift(), then read for its median.
-    The consensus line is the confidence-weighted average of those medians.
+    The consensus line is the EQUAL-weighted average of those medians — every
+    two-way book is one vote, regardless of how balanced its posted line is or
+    how many alt lines it has.
 
     Continuous models anchor at the (fractional) consensus median.
 
@@ -320,10 +322,10 @@ def calculate_consensus_fair_value(book_dataframes, book_ks=None,
                 median = line
                 src = 'posted line'
 
-        # Confidence: number of lines × balance of the posted point (a near-50/50
-        # two-way line is the most reliable location signal).
+        # Every two-way book is one equal input to the consensus location,
+        # regardless of its posted line's balance or its own alt-line depth.
         n_lines = e['n'] if e else 1
-        weight  = n_lines * max(1.0 - 2.0 * abs(fair_prob - prob_target), 0.05)
+        weight  = 1.0
 
         contrib = {
             'book': book_name,
@@ -801,11 +803,13 @@ def run_analysis(df, use_anchor, anchor_line, anchor_odds,
                     "distribution** (`model`): a two-way book with ≥2 lines uses its own "
                     "fit; a single-line two-way book borrows the best multi-line fit "
                     "(`role = shape donor`), relocated to its posted point. The consensus "
-                    "is the confidence-weighted average of those medians (weight = lines × "
-                    "balance). For **Discrete** models the anchor is placed on the nearest "
-                    "**posted two-way line** (preferring X.5 lines; whole-number lines are "
-                    "treated as a push and kept symmetric), and the anchor probability "
-                    "(`prob_at_anchor`) is the consensus P(X > line) there — generally not 50%."
+                    "is the **equal-weighted** average of those medians — every two-way "
+                    "book is one vote, regardless of how balanced its line is or how many "
+                    "alt lines it has. For **Discrete** models the anchor is placed on the "
+                    "nearest **posted two-way line** (preferring X.5 lines; whole-number "
+                    "lines are treated as a push and kept symmetric), and the anchor "
+                    "probability (`prob_at_anchor`) is the equal-weighted P(X > line) "
+                    "there — generally not 50%."
                 )
                 contrib_df = pd.DataFrame(contributions)
                 st.dataframe(contrib_df)
@@ -1024,10 +1028,12 @@ with st.expander("ℹ️ v2.4 — Distribution-Based Consensus Anchor"):
     - **Each two-way book's fair line is a fitted median.** A two-way book with ≥2
       lines uses its own fitted distribution's median (where `P(X > L) = 0.5`); a
       single-line two-way book borrows the donor shape, relocated to its posted
-      point, and reads that median. The consensus is the confidence-weighted average
-      of those medians (weight = lines × balance). This is materially more accurate
-      than a linear slope when projecting offset two-way lines over many points,
-      because real stat distributions are skewed.
+      point, and reads that median. The consensus is the **equal-weighted** average
+      of those medians — every two-way book is one vote, regardless of how balanced
+      its posted line is or how many alt lines it has. Deriving the median from a
+      real fitted distribution (rather than a linear slope) is materially more
+      accurate when projecting offset two-way lines over many points, because real
+      stat distributions are skewed.
     - **Discrete models anchor on a real posted two-way line.** When *Distribution
       Type* is **Discrete**, the anchor is the nearest posted two-way line to the
       consensus centre — preferring half (X.5) lines and only using whole-number
